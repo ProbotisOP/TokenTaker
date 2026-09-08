@@ -1,0 +1,7 @@
+{
+  "name": "Solana Autonomous Quant Trading System",
+  "description": "Production-grade autonomous Solana memecoin trading system with low-latency event detection, deterministic safety verification, microstructure flow analytics, risk-managed execution, and causal backtesting.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
+
