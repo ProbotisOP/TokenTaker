@@ -13,6 +13,9 @@ export interface SizingInput {
   currentExposureSol: number;
   riskLimits: RiskLimits;
   exitabilityScore?: number;
+  gasReserveSol?: number;
+  minTradeSizeSol?: number;
+  targetTradeSizeSol?: number;
 }
 
 export interface RiskEvaluationResult {
@@ -35,6 +38,10 @@ export class RiskEngine {
     const { portfolio, opportunity, safety, liquiditySol, openPositionsCount, riskLimits, exitabilityScore = 80 } = input;
     const rejectReasons: string[] = [];
 
+    const gasReserve = input.gasReserveSol !== undefined ? input.gasReserveSol : 0.025;
+    const minTradeSize = input.minTradeSizeSol !== undefined ? input.minTradeSizeSol : 0.01;
+    const availableCashForTrades = Math.max(0, portfolio.cashSol - gasReserve);
+
     // 1. Circuit Breaker Checks
     if (riskLimits.circuitBreakerActive) {
       rejectReasons.push('CIRCUIT BREAKER: Trading halted due to manual or risk trigger');
@@ -54,8 +61,8 @@ export class RiskEngine {
     }
 
     // 3. Cash Availability
-    if (portfolio.cashSol <= 0.2) {
-      rejectReasons.push(`INSUFFICIENT CAPITAL: Available cash (${portfolio.cashSol.toFixed(2)} SOL) below reserve buffer (0.2 SOL)`);
+    if (portfolio.cashSol <= gasReserve || availableCashForTrades < minTradeSize) {
+      rejectReasons.push(`INSUFFICIENT CAPITAL: Available cash (${portfolio.cashSol.toFixed(4)} SOL) minus reserve (${gasReserve} SOL) is below minimum trade size (${minTradeSize} SOL)`);
     }
 
     // 4. Slippage and Execution Limits
@@ -127,16 +134,25 @@ export class RiskEngine {
     // Modulate by independent exitability score (discount if pool is shallow)
     const exitabilityDiscount = Math.min(1.0, Math.max(0.4, exitabilityScore / 100));
 
-    // Base position size from equity
-    const maxAllocSol = portfolio.equitySol * riskLimits.maxPositionPercent;
-    let targetSizeSol = portfolio.equitySol * safeKellyFraction * adaptiveMultiplier * exitabilityDiscount;
+    // Base position size from equity and user config
+    const targetConfigSize = input.targetTradeSizeSol !== undefined ? input.targetTradeSizeSol : 0.02;
+    let targetSizeSol = Math.max(
+      minTradeSize,
+      Math.min(
+        availableCashForTrades,
+        targetConfigSize > 0 ? targetConfigSize : portfolio.equitySol * safeKellyFraction * adaptiveMultiplier * exitabilityDiscount
+      )
+    );
 
-    // Clamp by max allowable position percent
-    targetSizeSol = Math.min(targetSizeSol, maxAllocSol);
+    // If equity-based sizing was used and equity is high, clamp by max allowable position percent
+    if (portfolio.equitySol > 1.0) {
+      const maxAllocSol = portfolio.equitySol * riskLimits.maxPositionPercent;
+      targetSizeSol = Math.min(targetSizeSol, maxAllocSol);
+    }
 
     // Clamp by pool liquidity (never exceed 2.0% of pool liquidity to prevent severe price impact)
     const maxPoolImpactSize = liquiditySol * 0.02;
-    targetSizeSol = Math.min(targetSizeSol, maxPoolImpactSize);
+    targetSizeSol = Math.min(targetSizeSol, Math.max(minTradeSize, maxPoolImpactSize));
 
     // Clamp by single trade loss limit (assuming -15% stop loss)
     const stopLossMultiplier = 0.85; // -15% stop loss
@@ -144,11 +160,14 @@ export class RiskEngine {
     const maxByLossLimit = riskLimits.maxTradeLossSol / tradeRiskPct;
     targetSizeSol = Math.min(targetSizeSol, maxByLossLimit);
 
-    // Floor check: Minimum viable trade size (0.1 SOL)
-    if (targetSizeSol < 0.1) {
+    // Ensure we don't exceed available cash after reserve
+    targetSizeSol = Math.min(targetSizeSol, availableCashForTrades);
+
+    // Floor check: Minimum viable trade size
+    if (targetSizeSol < minTradeSize) {
       return {
         approved: false,
-        rejectReasons: [`SIZING FLOOR: Computed position size (${targetSizeSol.toFixed(3)} SOL) is below minimum threshold (0.1 SOL)`],
+        rejectReasons: [`SIZING FLOOR: Computed position size (${targetSizeSol.toFixed(4)} SOL) is below minimum threshold (${minTradeSize} SOL)`],
         recommendedSizeSol: 0,
         maxAllowableLossSol: 0,
         stopLossPriceMultiplier: 0.85,

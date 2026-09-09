@@ -10,6 +10,10 @@ import {
   Cpu,
   Layers,
   ArrowRight,
+  Copy,
+  Check,
+  ExternalLink,
+  Flame,
 } from 'lucide-react';
 import { CandidateTokenState, DecisionAction } from '../types.ts';
 
@@ -22,6 +26,7 @@ interface ExplainabilityModalProps {
 export const ExplainabilityModal: React.FC<ExplainabilityModalProps> = ({ candidate, onClose, onRealBuy }) => {
   const [aiLoading, setAiLoading] = useState(false);
   const [aiAnalysis, setAiAnalysis] = useState<string | null>(null);
+  const [copiedMint, setCopiedMint] = useState(false);
 
   if (!candidate) return null;
 
@@ -83,9 +88,43 @@ export const ExplainabilityModal: React.FC<ExplainabilityModalProps> = ({ candid
                   {metadata.launchVenue}
                 </span>
               </div>
-              <p className="text-xs text-zinc-500 font-mono">
-                Mint: {metadata.mint} &bull; Pool: {metadata.poolAddress}
-              </p>
+              <div className="flex items-center gap-2 text-xs text-zinc-400 font-mono mt-0.5 flex-wrap">
+                <div className="flex items-center gap-1 bg-zinc-950 border border-zinc-800 rounded px-2 py-0.5">
+                  <span className="text-zinc-500 font-bold">CA:</span>
+                  <span className="text-zinc-200">{metadata.mint.slice(0, 6)}...{metadata.mint.slice(-6)}</span>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      navigator.clipboard.writeText(metadata.mint);
+                      setCopiedMint(true);
+                      setTimeout(() => setCopiedMint(false), 1800);
+                    }}
+                    className="hover:text-emerald-400 p-0.5 transition"
+                    title="Copy full contract address"
+                  >
+                    {copiedMint ? <Check className="w-3 h-3 text-emerald-400" /> : <Copy className="w-3 h-3" />}
+                  </button>
+                  <a
+                    href={`https://solscan.io/token/${metadata.mint}`}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="text-zinc-500 hover:text-cyan-400 p-0.5 transition"
+                    title="View on Solscan"
+                  >
+                    <ExternalLink className="w-3 h-3" />
+                  </a>
+                  <a
+                    href={`https://dexscreener.com/solana/${metadata.mint}`}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="text-zinc-500 hover:text-amber-400 p-0.5 transition"
+                    title="View on DexScreener"
+                  >
+                    <Flame className="w-3 h-3 text-amber-500" />
+                  </a>
+                </div>
+                <span className="text-zinc-500">&bull; Pool: {metadata.poolAddress.slice(0, 4)}...{metadata.poolAddress.slice(-4)}</span>
+              </div>
             </div>
           </div>
 

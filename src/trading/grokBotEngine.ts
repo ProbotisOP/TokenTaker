@@ -14,6 +14,7 @@
  */
 
 import { GrokBotCycleLog, GrokBotPosition, GrokBotState } from '../types.ts';
+import { LiveTokenFeedService, VERIFIED_SOLANA_MEMES } from './liveTokenFeed.ts';
 
 const SOL_USD = 155.0;
 
@@ -598,13 +599,17 @@ export class GrokBotEngine {
   }
 
   private generateLaunchCandidate(preset?: 'GEM' | 'RUG' | 'FAKE_HYPE'): any {
+    const feed = LiveTokenFeedService.getInstance();
+    const token = feed.getNextRealToken();
+    const isClean = token.liquiditySol >= 8.0;
+
     if (preset === 'RUG') {
       return {
-        symbol: 'RUGSCAM',
-        name: 'Honey Rug Trap',
-        mint: `SoL${Math.random().toString(36).substring(2, 6)}...RUG`,
-        poolDepthSol: 4.2,
-        initialPriceUsd: 0.000042,
+        symbol: token.symbol,
+        name: token.name,
+        mint: token.mint,
+        poolDepthSol: Math.min(4.5, token.liquiditySol),
+        initialPriceUsd: token.priceUsd > 0 ? token.priceUsd : 0.000042,
         mintAuthRevoked: false,
         lpLocked: false,
         top10Pct: 78.4,
@@ -616,110 +621,32 @@ export class GrokBotEngine {
 
     if (preset === 'FAKE_HYPE') {
       return {
-        symbol: 'ASTROBOT',
-        name: 'Bot Farm Hype',
-        mint: `SoL${Math.random().toString(36).substring(2, 6)}...ASTRO`,
-        poolDepthSol: 9.5,
-        initialPriceUsd: 0.00012,
+        symbol: token.symbol,
+        name: token.name,
+        mint: token.mint,
+        poolDepthSol: Math.min(9.5, token.liquiditySol),
+        initialPriceUsd: token.priceUsd > 0 ? token.priceUsd : 0.00012,
         mintAuthRevoked: true,
         lpLocked: true,
         top10Pct: 41.2,
         socialScore: 96,
-        mempoolFlowSol: 0.8, // loud chatter, dead mempool
+        mempoolFlowSol: 0.8,
         safetyScore: 65,
       };
     }
 
-    if (preset === 'GEM') {
-      return {
-        symbol: 'PEPEAI',
-        name: 'Pepe Autonomous Quant',
-        mint: `SoL${Math.random().toString(36).substring(2, 6)}...PEPEAI`,
-        poolDepthSol: 26.5,
-        initialPriceUsd: 0.00035,
-        mintAuthRevoked: true,
-        lpLocked: true,
-        top10Pct: 24.5,
-        socialScore: 78,
-        mempoolFlowSol: 18.5,
-        safetyScore: 94,
-      };
-    }
-
-    // Dynamic pool of tokens
-    const names = [
-      { sym: 'GROK41', name: 'Grok $41 Runner', isGem: true },
-      { sym: 'MEMEPUMP', name: 'Meme Velocity', isGem: true },
-      { sym: 'SOLSNIPE', name: 'Solana Speedster', isGem: true },
-      { sym: 'HONEYPOT', name: 'Locked Honeypot', isGem: false, isRug: true },
-      { sym: 'TWITRAID', name: 'Astroturf Raid', isGem: false, isHype: true },
-      { sym: 'WHALEDROP', name: 'Whale Concentrated', isGem: false, highConcentration: true },
-      { sym: 'DEEPPOOL', name: 'Deep Liquidity Gem', isGem: true },
-    ];
-
-    const pick = names[Math.floor(Math.random() * names.length)];
-
-    if (pick.isRug) {
-      return {
-        symbol: pick.sym,
-        name: pick.name,
-        mint: `SoL${Math.random().toString(36).substring(2, 6)}...${pick.sym}`,
-        poolDepthSol: 3.5,
-        initialPriceUsd: 0.00003,
-        mintAuthRevoked: false,
-        lpLocked: false,
-        top10Pct: 68.0,
-        socialScore: 84,
-        mempoolFlowSol: 0.5,
-        safetyScore: 22,
-      };
-    }
-
-    if (pick.isHype) {
-      return {
-        symbol: pick.sym,
-        name: pick.name,
-        mint: `SoL${Math.random().toString(36).substring(2, 6)}...${pick.sym}`,
-        poolDepthSol: 11.0,
-        initialPriceUsd: 0.00018,
-        mintAuthRevoked: true,
-        lpLocked: true,
-        top10Pct: 44.0,
-        socialScore: 94,
-        mempoolFlowSol: 1.1,
-        safetyScore: 68,
-      };
-    }
-
-    if (pick.highConcentration) {
-      return {
-        symbol: pick.sym,
-        name: pick.name,
-        mint: `SoL${Math.random().toString(36).substring(2, 6)}...${pick.sym}`,
-        poolDepthSol: 16.0,
-        initialPriceUsd: 0.00022,
-        mintAuthRevoked: true,
-        lpLocked: true,
-        top10Pct: 62.0,
-        socialScore: 55,
-        mempoolFlowSol: 5.0,
-        safetyScore: 45,
-      };
-    }
-
-    // Default clean gem
     return {
-      symbol: pick.sym,
-      name: pick.name,
-      mint: `SoL${Math.random().toString(36).substring(2, 6)}...${pick.sym}`,
-      poolDepthSol: 18.0 + (Math.random() * 32.0),
-      initialPriceUsd: 0.00025 + (Math.random() * 0.0008),
+      symbol: token.symbol,
+      name: token.name,
+      mint: token.mint,
+      poolDepthSol: Math.max(8.0, token.liquiditySol),
+      initialPriceUsd: token.priceUsd > 0 ? token.priceUsd : 0.00035,
       mintAuthRevoked: true,
       lpLocked: true,
-      top10Pct: 18.0 + (Math.random() * 16.0),
-      socialScore: 65 + Math.floor(Math.random() * 25),
-      mempoolFlowSol: 8.0 + (Math.random() * 24.0),
-      safetyScore: 88 + Math.floor(Math.random() * 10),
+      top10Pct: 24.5,
+      socialScore: 78,
+      mempoolFlowSol: Math.max(2.0, token.liquiditySol * 0.15),
+      safetyScore: isClean ? 94 : 55,
     };
   }
 
@@ -853,54 +780,54 @@ export class GrokBotEngine {
     // Seed 2 active open positions currently running right now
     const activePositions: GrokBotPosition[] = [
       {
-        id: 'GROK_POS_SPEEDY',
-        symbol: 'SPEEDY',
-        name: 'Solana Speedster',
-        tokenMint: 'SoLSpeed...77b',
-        poolDepthSol: 34.5,
-        entryPriceUsd: 0.00042,
-        currentPriceUsd: 0.00058,
-        entryPriceSol: 0.00042 / SOL_USD,
-        currentPriceSol: 0.00058 / SOL_USD,
-        highestPriceUsd: 0.00061,
-        sizeTokens: 620_000,
-        costBasisUsd: 260.4,
-        currentValueUsd: 359.6,
-        unrealizedPnlUsd: 99.2,
-        unrealizedPnlPct: 38.1,
+        id: 'GROK_POS_BONK',
+        symbol: 'BONK',
+        name: 'Bonk',
+        tokenMint: 'DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263',
+        poolDepthSol: 18500,
+        entryPriceUsd: 0.000024,
+        currentPriceUsd: 0.000028,
+        entryPriceSol: 0.000024 / SOL_USD,
+        currentPriceSol: 0.000028 / SOL_USD,
+        highestPriceUsd: 0.000029,
+        sizeTokens: 10_000_000,
+        costBasisUsd: 240.0,
+        currentValueUsd: 280.0,
+        unrealizedPnlUsd: 40.0,
+        unrealizedPnlPct: 16.7,
         holdingTimeSec: 142,
-        trailingStopPriceUsd: 0.00052,
-        nextTakeProfitUsd: 0.00068,
+        trailingStopPriceUsd: 0.000025,
+        nextTakeProfitUsd: 0.000035,
         takeProfitStage: 0,
-        safetyScore: 92,
-        socialScore: 82,
-        mempoolFlowSol: 22.4,
+        safetyScore: 98,
+        socialScore: 89,
+        mempoolFlowSol: 120.4,
         enteredAt: Date.now() - 142000,
         lastUpdated: Date.now(),
       },
       {
-        id: 'GROK_POS_WHALEX',
-        symbol: 'WHALEX',
-        name: 'Whale Accumulator X',
-        tokenMint: 'SoLWhale...99p',
-        poolDepthSol: 48.0,
-        entryPriceUsd: 0.0012,
-        currentPriceUsd: 0.00138,
-        entryPriceSol: 0.0012 / SOL_USD,
-        currentPriceSol: 0.00138 / SOL_USD,
-        highestPriceUsd: 0.00142,
-        sizeTokens: 180_000,
-        costBasisUsd: 216.0,
-        currentValueUsd: 248.4,
-        unrealizedPnlUsd: 32.4,
-        unrealizedPnlPct: 15.0,
+        id: 'GROK_POS_WIF',
+        symbol: 'WIF',
+        name: 'dogwifhat',
+        tokenMint: 'EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm',
+        poolDepthSol: 24000,
+        entryPriceUsd: 1.65,
+        currentPriceUsd: 1.85,
+        entryPriceSol: 1.65 / SOL_USD,
+        currentPriceSol: 1.85 / SOL_USD,
+        highestPriceUsd: 1.89,
+        sizeTokens: 150,
+        costBasisUsd: 247.5,
+        currentValueUsd: 277.5,
+        unrealizedPnlUsd: 30.0,
+        unrealizedPnlPct: 12.1,
         holdingTimeSec: 68,
-        trailingStopPriceUsd: 0.00122,
-        nextTakeProfitUsd: 0.0017,
+        trailingStopPriceUsd: 1.70,
+        nextTakeProfitUsd: 2.10,
         takeProfitStage: 0,
-        safetyScore: 95,
-        socialScore: 76,
-        mempoolFlowSol: 38.0,
+        safetyScore: 98,
+        socialScore: 94,
+        mempoolFlowSol: 250.0,
         enteredAt: Date.now() - 68000,
         lastUpdated: Date.now(),
       },
@@ -938,14 +865,14 @@ export class GrokBotEngine {
       equityCurve,
       currentCyclePhase: 'IDLE',
       currentInspectedToken: {
-        symbol: 'SPEEDY',
-        name: 'Solana Speedster',
-        poolDepthSol: 34.5,
+        symbol: 'BONK',
+        name: 'Bonk',
+        poolDepthSol: 450.0,
         mintAuthRevoked: true,
         lpLocked: true,
-        top10Pct: 24.0,
-        socialScore: 82,
-        mempoolFlowSol: 22.4,
+        top10Pct: 14.0,
+        socialScore: 94,
+        mempoolFlowSol: 85.4,
         status: 'SNIPED',
         statusText: 'Active position open. Trailing runner profit.',
       },

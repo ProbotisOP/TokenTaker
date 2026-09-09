@@ -29,6 +29,10 @@ import { SafetyEngine } from './safetyEngine.ts';
 import { ScoringEngine } from './scoringEngine.ts';
 import { WalletIntelligence } from './walletIntelligence.ts';
 import { VenueSimulator } from './venueSimulator.ts';
+import { WalletManager } from './walletManager.ts';
+import { LiveTokenFeedService, VERIFIED_SOLANA_MEMES } from './liveTokenFeed.ts';
+import { JupiterService, SOL_MINT } from './jupiterService.ts';
+import { lamportsToSol } from './decimalSafeUtils.ts';
 
 export interface CandidateTokenState {
   metadata: TokenMetadata;
@@ -56,20 +60,20 @@ export class EngineCoordinator {
   public weights: StrategyWeights = { ...DEFAULT_STRATEGY_WEIGHTS };
 
   public portfolio: PortfolioState = {
-    cashSol: 25.0,
-    equitySol: 25.0,
+    cashSol: 0,
+    equitySol: 0,
     activeExposureSol: 0,
     dailyRealizedPnlSol: 0,
     totalRealizedPnlSol: 0,
     unrealizedPnlSol: 0,
-    peakEquitySol: 25.0,
+    peakEquitySol: 0,
     currentDrawdownPct: 0,
     maxDrawdownPct: 0,
     consecutiveLosses: 0,
-    rollingWinRate: 0.62,
-    rollingExpectancySol: 0.28,
-    profitFactor: 2.15,
-    tradeCount: 24,
+    rollingWinRate: 0,
+    rollingExpectancySol: 0,
+    profitFactor: 0,
+    tradeCount: 0,
     adaptiveMultiplier: 1.0,
   };
 
@@ -80,7 +84,9 @@ export class EngineCoordinator {
 
   private microEngines = new Map<string, MicrostructureEngine>();
   private simulationInterval: NodeJS.Timeout | null = null;
+  private pricePollInterval: NodeJS.Timeout | null = null;
   private isProcessing = false;
+  private isPollingPrices = false;
 
   private constructor() {
     this.seedInitialState();
@@ -286,6 +292,12 @@ export class EngineCoordinator {
       creatorLpBurnedOrLocked: safety.lpBurnOrLocked,
     }, 0.5);
 
+    const wm = WalletManager.getInstance();
+    const wmConfig = wm.getConfig();
+    if (wmConfig.isConnected && wmConfig.balanceSol > 0) {
+      this.portfolio.cashSol = wmConfig.balanceSol;
+    }
+
     const riskCheck = RiskEngine.evaluateAndSize({
       portfolio: this.portfolio,
       opportunity,
@@ -295,6 +307,9 @@ export class EngineCoordinator {
       currentExposureSol: this.portfolio.activeExposureSol,
       riskLimits: this.riskLimits,
       exitabilityScore,
+      gasReserveSol: wmConfig.gasReserveSol,
+      minTradeSizeSol: wmConfig.minTradeSizeSol,
+      targetTradeSizeSol: wmConfig.targetTradeSizeSol,
     });
 
     // 6. Pre-Check Execution
@@ -359,8 +374,8 @@ export class EngineCoordinator {
     this.candidateTokens.unshift(candidate);
     if (this.candidateTokens.length > 50) this.candidateTokens.pop();
 
-    // If BUY and mode permits, execute entry
-    if (decision === DecisionAction.BUY && (this.config.mode === SystemMode.PAPER || this.config.mode === SystemMode.LIVE)) {
+    // If BUY and mode permits, execute entry (LIVE ONLY - paper trades retired)
+    if (decision === DecisionAction.BUY && this.config.mode === SystemMode.LIVE) {
       this.executeBuyOrder(candidate, riskCheck.recommendedSizeSol);
     }
 
@@ -368,70 +383,117 @@ export class EngineCoordinator {
   }
 
   private executeBuyOrder(candidate: CandidateTokenState, sizeSol: number): void {
-    const execution = ExecutionEngine.executeBuy(
-      {
-        tokenMint: candidate.metadata.mint,
-        symbol: candidate.metadata.symbol,
-        sizeSol,
-        expectedPriceSol: candidate.micro.priceSol,
-        poolLiquiditySol: candidate.micro.liquiditySol,
-        detected_at: candidate.detected_at,
-        parsed_at: candidate.parsed_at,
-        scored_at: candidate.scored_at,
-        decision_at: candidate.decision_at,
-        slippageLimitPct: this.riskLimits.maxSlippagePercent,
-        expectedEdgePct: candidate.opportunity.expectedReturnPct,
-      },
-      this.config.mode === SystemMode.LIVE
-    );
+    if (this.config.mode !== SystemMode.LIVE) {
+      return;
+    }
 
-    if (execution.status !== TradeStatus.CONFIRMED) return;
-
-    const solUsdRate = 155.0;
-    const ladder = ExitEngine.createLadder(execution.actualPriceSol);
-
-    const position: Position = {
-      id: `POS_${candidate.metadata.symbol}_${Date.now()}`,
+    const wm = WalletManager.getInstance();
+    const cfg = wm.getConfig();
+    if (!cfg.lastPreflightPassed || !wm.getDedicatedKeypair()) {
+      console.warn('[EngineCoordinator] LIVE trade blocked: Preflight diagnostic must pass before live execution.');
+      return;
+    }
+    wm.executeSignalTrade({
       tokenMint: candidate.metadata.mint,
       symbol: candidate.metadata.symbol,
       name: candidate.metadata.name,
-      entryPriceSol: execution.actualPriceSol,
-      entryPriceUsd: execution.actualPriceSol * solUsdRate,
-      currentPriceSol: execution.actualPriceSol,
-      currentPriceUsd: execution.actualPriceSol * solUsdRate,
-      peakPriceUsd: execution.actualPriceSol * solUsdRate,
-      lowestPriceUsd: execution.actualPriceSol * solUsdRate,
-      sizeTokens: execution.sizeTokens,
-      costBasisSol: sizeSol,
-      currentValueSol: sizeSol,
-      unrealizedPnlSol: 0,
-      unrealizedPnlPct: 0,
-      realizedPnlSol: 0,
-      enteredAt: execution.latencyBreakdown.confirmed_at,
-      holdingSec: 0,
-      stopLossPriceSol: ladder.stopLossPriceSol,
-      takeProfitLadder: ladder.takeProfitLadder,
-      trailingStopPriceSol: ladder.trailingStopPriceSol,
-      trailingActivated: false,
-      status: 'OPEN',
-      executionHistory: [
-        {
-          action: 'ENTRY',
-          priceSol: execution.actualPriceSol,
-          tokens: execution.sizeTokens,
-          pnlSol: 0,
-          timestamp: execution.latencyBreakdown.confirmed_at,
-          txSignature: execution.txSignature,
-        },
-      ],
-    };
+      priceSol: candidate.micro.priceSol,
+      priceUsd: candidate.micro.priceUsd,
+      signalSource: `COORDINATOR_${candidate.metadata.launchVenue}`,
+      signalScore: candidate.opportunity.opportunityScore,
+      recommendedSizeSol: sizeSol,
+    }).catch((err) => console.error('[EngineCoordinator] Live execution error:', err));
+  }
 
-    this.activePositions.push(position);
-    this.portfolio.cashSol -= sizeSol;
-    this.recalculatePortfolio();
+  /**
+   * Polls real on-chain market prices for all active positions from DexScreener / Jupiter
+   */
+  public async pollLivePricesForActivePositions(): Promise<void> {
+    if (this.isPollingPrices || this.activePositions.length === 0) return;
+    this.isPollingPrices = true;
 
-    // Record decision audit
-    this.recordDecisionAudit(position, DecisionAction.BUY, candidate.decisionReasons, candidate.opportunity.opportunityScore, 0, candidate.safety.safetyScore, execution);
+    try {
+      const realPositions = this.activePositions.filter((p) => p.isRealWalletTrade && p.tokenMint);
+      if (realPositions.length === 0) return;
+
+      const mints = Array.from(new Set(realPositions.map((p) => p.tokenMint)));
+      const res = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${mints.join(',')}`, {
+        headers: { 'Accept': 'application/json' },
+        signal: AbortSignal.timeout(4000),
+      }).catch(() => null);
+
+      let pairs: any[] = [];
+      if (res && res.ok) {
+        const data = await res.json().catch(() => ({}));
+        pairs = Array.isArray(data?.pairs) ? data.pairs : [];
+      }
+
+      for (const pos of realPositions) {
+        const tokenPairs = pairs.filter(
+          (p: any) => p.baseToken?.address === pos.tokenMint && p.chainId === 'solana'
+        );
+        tokenPairs.sort((a: any, b: any) => Number(b.liquidity?.usd || 0) - Number(a.liquidity?.usd || 0));
+        const bestPair = tokenPairs[0];
+
+        if (bestPair && Number(bestPair.priceNative) > 0) {
+          const realPriceSol = Number(bestPair.priceNative);
+          const realPriceUsd = Number(bestPair.priceUsd || realPriceSol * 155.0);
+
+          pos.currentPriceSol = realPriceSol;
+          pos.currentPriceUsd = realPriceUsd;
+          pos.currentValueSol = pos.sizeTokens * realPriceSol;
+          pos.unrealizedPnlSol = pos.currentValueSol - pos.costBasisSol;
+          pos.unrealizedPnlPct = pos.costBasisSol > 0 ? (pos.unrealizedPnlSol / pos.costBasisSol) * 100 : 0;
+
+          if (realPriceUsd > (pos.peakPriceUsd || 0)) {
+            pos.peakPriceUsd = realPriceUsd;
+          }
+
+          const microEngine = this.microEngines.get(pos.tokenMint);
+          if (microEngine) {
+            microEngine.recordTick({
+              timestamp: Date.now(),
+              isBuy: (bestPair.priceChange?.m5 || 0) >= 0,
+              tokenAmount: 1000,
+              solAmount: (bestPair.liquidity?.quote || 10) * 0.01,
+              priceSol: realPriceSol,
+              priceUsd: realPriceUsd,
+              traderWallet: 'LiveDex',
+              isNewWallet: false,
+            });
+          }
+        } else if (pos.sizeTokens > 0) {
+          // If not indexed on DexScreener yet (e.g. brand new launch), fallback to real Jupiter sell quote
+          try {
+            const quote = await JupiterService.fetchQuote({
+              inputMint: pos.tokenMint,
+              outputMint: SOL_MINT,
+              amountLamports: BigInt(Math.floor(pos.sizeTokens)),
+              slippageBps: 200,
+            });
+
+            if (quote && quote.outAmount) {
+              const solValue = lamportsToSol(quote.outAmount);
+              pos.currentPriceSol = solValue / pos.sizeTokens;
+              pos.currentPriceUsd = pos.currentPriceSol * 155.0;
+              pos.currentValueSol = solValue;
+              pos.unrealizedPnlSol = solValue - pos.costBasisSol;
+              pos.unrealizedPnlPct = pos.costBasisSol > 0 ? (pos.unrealizedPnlSol / pos.costBasisSol) * 100 : 0;
+              if (pos.currentPriceUsd > (pos.peakPriceUsd || 0)) {
+                pos.peakPriceUsd = pos.currentPriceUsd;
+              }
+            }
+          } catch {
+            // retain last verified real price
+          }
+        }
+      }
+      this.recalculatePortfolio();
+    } catch {
+      // ignore network errors
+    } finally {
+      this.isPollingPrices = false;
+    }
   }
 
   /**
@@ -445,11 +507,49 @@ export class EngineCoordinator {
 
     for (const pos of this.activePositions) {
       pos.holdingSec = Math.round((Date.now() - pos.enteredAt) / 1000);
-      const microEngine = this.microEngines.get(pos.tokenMint);
 
-      // Simulate micro price tick
+      // REAL ON-CHAIN POSITIONS: Never apply random walk drift!
+      if (pos.isRealWalletTrade) {
+        const currentPriceSol = pos.currentPriceSol;
+        pos.currentValueSol = pos.sizeTokens * currentPriceSol;
+        pos.unrealizedPnlSol = pos.currentValueSol - pos.costBasisSol;
+        pos.unrealizedPnlPct = pos.costBasisSol > 0 ? (pos.unrealizedPnlSol / pos.costBasisSol) * 100 : 0;
+
+        // Trailing stop update with real price
+        const trailingUpdate = ExitEngine.updateTrailingStop(pos, currentPriceSol);
+        pos.trailingStopPriceSol = trailingUpdate.newTrailingPriceSol;
+        pos.trailingActivated = trailingUpdate.trailingActivated;
+        pos.peakPriceUsd = trailingUpdate.peakPriceUsd;
+
+        let microEngine = this.microEngines.get(pos.tokenMint);
+        if (!microEngine) {
+          microEngine = new MicrostructureEngine(25.0, currentPriceSol);
+          this.microEngines.set(pos.tokenMint, microEngine);
+        }
+        const liveMicro = microEngine.getSnapshot();
+
+        const exitSignal = ExitEngine.evaluatePosition(pos, liveMicro);
+        if (exitSignal.shouldExit) {
+          if (exitSignal.action === 'FULL_EXIT') {
+            WalletManager.getInstance().oneClickExit({
+              positionId: pos.id,
+              pctToExit: 100,
+              reason: exitSignal.reason,
+            }).catch((err) => console.error('[EngineCoordinator] Live auto-exit failed:', err));
+          } else if (exitSignal.action === 'SCALE_OUT') {
+            WalletManager.getInstance().oneClickExit({
+              positionId: pos.id,
+              pctToExit: 50,
+              reason: exitSignal.reason,
+            }).catch((err) => console.error('[EngineCoordinator] Live auto scale-out failed:', err));
+          }
+        }
+        continue;
+      }
+
+      // Simulated/paper positions (if any)
+      const microEngine = this.microEngines.get(pos.tokenMint);
       if (microEngine) {
-        // Organic random walk with momentum bias
         const drift = (Math.random() * 0.04) - 0.016;
         const newPriceSol = Math.max(0.0000001, pos.currentPriceSol * (1 + drift));
         microEngine.recordTick({
@@ -470,13 +570,11 @@ export class EngineCoordinator {
         pos.unrealizedPnlSol = pos.currentValueSol - pos.costBasisSol;
         pos.unrealizedPnlPct = (pos.unrealizedPnlSol / pos.costBasisSol) * 100;
 
-        // Update trailing stop
         const trailingUpdate = ExitEngine.updateTrailingStop(pos, newPriceSol);
         pos.trailingStopPriceSol = trailingUpdate.newTrailingPriceSol;
         pos.trailingActivated = trailingUpdate.trailingActivated;
         pos.peakPriceUsd = trailingUpdate.peakPriceUsd;
 
-        // Evaluate exit criteria
         const exitSignal = ExitEngine.evaluatePosition(pos, liveMicro);
 
         if (exitSignal.shouldExit) {
@@ -491,7 +589,6 @@ export class EngineCoordinator {
             this.portfolio.dailyRealizedPnlSol += pos.realizedPnlSol;
             this.portfolio.totalRealizedPnlSol += pos.realizedPnlSol;
 
-            // Track win/loss for adaptive position sizing
             if (pos.realizedPnlSol > 0) {
               this.portfolio.consecutiveLosses = 0;
             } else {
@@ -501,7 +598,6 @@ export class EngineCoordinator {
             positionsToClose.push(pos);
             this.recordDecisionAudit(pos, DecisionAction.EXIT_HARD_STOP, [exitSignal.reason], 0, pos.realizedPnlSol);
           } else if (exitSignal.action === 'SCALE_OUT') {
-            // Partial scale out (e.g. 35%)
             const tokensToSell = Math.floor(pos.sizeTokens * (exitSignal.pctToSell / 100));
             const sellResult = ExecutionEngine.executeSell(pos.tokenMint, tokensToSell, newPriceSol, liveMicro.liquiditySol);
             pos.sizeTokens -= tokensToSell;
@@ -536,6 +632,12 @@ export class EngineCoordinator {
   }
 
   public recalculatePortfolio(): void {
+    const wm = WalletManager.getInstance();
+    const wmConfig = wm.getConfig();
+    if (wmConfig.isConnected && wmConfig.balanceSol > 0) {
+      this.portfolio.cashSol = wmConfig.balanceSol;
+    }
+
     const exposure = this.activePositions.reduce((sum, p) => sum + p.currentValueSol, 0);
     const unrealized = this.activePositions.reduce((sum, p) => sum + p.unrealizedPnlSol, 0);
     const equity = this.portfolio.cashSol + exposure;
@@ -632,102 +734,27 @@ export class EngineCoordinator {
         this.simulateIncomingLaunch();
       }
     }, 1000);
+
+    // Live on-chain price polling for all active real wallet positions
+    this.pricePollInterval = setInterval(() => {
+      this.pollLivePricesForActivePositions().catch(() => {});
+    }, 2000);
   }
 
   private simulateIncomingLaunch(): void {
-    const memes = [
-      { name: 'Quantum Shib', symbol: 'QSHIB', venue: LaunchVenue.PUMPFUN },
-      { name: 'Solana Speedster', symbol: 'SPEEDY', venue: LaunchVenue.RAYDIUM_AMM_V4 },
-      { name: 'Laser Eyes Whale', symbol: 'WHALE', venue: LaunchVenue.RAYDIUM_CPMM },
-      { name: 'Meteora Dynamic Sol', symbol: 'DYNASOL', venue: LaunchVenue.METEORA_DLMM },
-      { name: 'Rugbait Honey', symbol: 'RUGBAIT', venue: LaunchVenue.PUMPFUN },
-      { name: 'HedgeFund Pepe', symbol: 'HFPEPE', venue: LaunchVenue.RAYDIUM_AMM_V4 },
-    ];
-
-    const pick = memes[Math.floor(Math.random() * memes.length)];
-    const isBadLaunch = pick.symbol === 'RUGBAIT' || Math.random() < 0.35;
-
-    this.ingestNewTokenLaunch({
-      mint: `SoL${Math.random().toString(36).substring(2, 6)}...${pick.symbol}`,
-      name: pick.name,
-      symbol: pick.symbol,
-      creator: `Deployer_${Math.random().toString(36).substring(2, 8)}`,
-      venue: pick.venue,
-      initialLiquiditySol: isBadLaunch ? 3.5 : 12.0 + (Math.random() * 25.0),
-      initialPriceSol: 0.0000025 + (Math.random() * 0.0000015),
-      hasMintAuth: isBadLaunch && Math.random() < 0.6,
-      hasFreezeAuth: isBadLaunch && Math.random() < 0.5,
-      lpBurnPct: isBadLaunch ? 40 : 100,
-      top1Pct: isBadLaunch ? 24.5 : 9.2,
-      top10Pct: isBadLaunch ? 74.0 : 41.5,
-      creatorOwnershipPct: isBadLaunch ? 14.0 : 2.5,
-      insiderBundles: isBadLaunch ? 5 : 0,
-      washTrading: isBadLaunch && Math.random() < 0.4,
-      creatorDumpRisk: isBadLaunch && Math.random() < 0.5,
-    });
+    const feed = LiveTokenFeedService.getInstance();
+    const nextRealToken = feed.getNextRealToken();
+    const payload = feed.toIngestPayload(nextRealToken);
+    this.ingestNewTokenLaunch(payload);
   }
 
   private seedInitialState(): void {
-    // Seed initial historical trades for dashboard visual richness
-    const seedLaunches = [
-      {
-        mint: 'SoL9842...PEPE2',
-        symbol: 'PEPE2',
-        name: 'Pepe 2.0 Solana',
-        creator: 'Auth_39x...Seed',
-        venue: LaunchVenue.PUMPFUN,
-        initialLiquiditySol: 18.5,
-        initialPriceSol: 0.0000018,
-        hasMintAuth: false,
-        hasFreezeAuth: false,
-        lpBurnPct: 100,
-        top1Pct: 8.5,
-        top10Pct: 38.2,
-        creatorOwnershipPct: 1.8,
-        insiderBundles: 0,
-        washTrading: false,
-        creatorDumpRisk: false,
-      },
-      {
-        mint: 'SoL1190...DOGEAI',
-        symbol: 'DOGEAI',
-        name: 'Doge Agent AI',
-        creator: 'Auth_55p...Seed',
-        venue: LaunchVenue.RAYDIUM_AMM_V4,
-        initialLiquiditySol: 28.0,
-        initialPriceSol: 0.0000034,
-        hasMintAuth: false,
-        hasFreezeAuth: false,
-        lpBurnPct: 100,
-        top1Pct: 11.2,
-        top10Pct: 44.0,
-        creatorOwnershipPct: 3.2,
-        insiderBundles: 1,
-        washTrading: false,
-        creatorDumpRisk: false,
-      },
-      {
-        mint: 'SoL7721...RUGSCAM',
-        symbol: 'SCAMPUMP',
-        name: 'Scam Pump Token',
-        creator: 'Auth_99z...BadDeployer',
-        venue: LaunchVenue.PUMPFUN,
-        initialLiquiditySol: 4.2,
-        initialPriceSol: 0.0000011,
-        hasMintAuth: true,
-        hasFreezeAuth: true,
-        lpBurnPct: 20,
-        top1Pct: 31.0,
-        top10Pct: 82.0,
-        creatorOwnershipPct: 21.0,
-        insiderBundles: 6,
-        washTrading: true,
-        creatorDumpRisk: true,
-      },
-    ];
+    const feed = LiveTokenFeedService.getInstance();
+    const seedTokens = VERIFIED_SOLANA_MEMES;
 
-    for (const item of seedLaunches) {
-      this.ingestNewTokenLaunch(item);
+    for (const item of seedTokens) {
+      const payload = feed.toIngestPayload(item);
+      this.ingestNewTokenLaunch(payload);
     }
   }
 }

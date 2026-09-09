@@ -38,6 +38,7 @@ import {
   SystemMode,
   TradeDecisionRecord,
   WalletAutotradeConfig,
+  LivePortfolioTelemetry,
 } from './types.ts';
 import { DEFAULT_RISK_LIMITS, DEFAULT_STRATEGY_WEIGHTS, DEFAULT_SYSTEM_CONFIG } from './trading/config.ts';
 
@@ -68,6 +69,7 @@ export const App: React.FC = () => {
   const [riskLimits, setRiskLimits] = useState<RiskLimits>(DEFAULT_RISK_LIMITS);
   const [weights, setWeights] = useState<StrategyWeights>(DEFAULT_STRATEGY_WEIGHTS);
   const [activePositions, setActivePositions] = useState<Position[]>([]);
+  const [closedPositions, setClosedPositions] = useState<Position[]>([]);
   const [candidates, setCandidates] = useState<CandidateTokenState[]>([]);
   const [tradeHistory, setTradeHistory] = useState<TradeDecisionRecord[]>([]);
 
@@ -77,6 +79,7 @@ export const App: React.FC = () => {
 
   // Real Money Trading Modal State
   const [walletConfig, setWalletConfig] = useState<WalletAutotradeConfig | null>(null);
+  const [livePortfolio, setLivePortfolio] = useState<LivePortfolioTelemetry | null>(null);
   const [realTradeModalOpen, setRealTradeModalOpen] = useState(false);
   const [tradeModalCandidate, setTradeModalCandidate] = useState<CandidateTokenState | null>(null);
   const [tradeModalMint, setTradeModalMint] = useState<string | undefined>(undefined);
@@ -92,9 +95,11 @@ export const App: React.FC = () => {
       const data = await res.json();
       if (data.config) setConfig(data.config);
       if (data.portfolio) setPortfolio(data.portfolio);
+      if (data.livePortfolio) setLivePortfolio(data.livePortfolio);
       if (data.riskLimits) setRiskLimits(data.riskLimits);
       if (data.weights) setWeights(data.weights);
       if (data.activePositions) setActivePositions(data.activePositions);
+      if (data.closedPositions) setClosedPositions(data.closedPositions);
       if (data.candidateTokens) {
         setCandidates(data.candidateTokens);
         if (!selectedMicroCandidate && data.candidateTokens.length > 0) {
@@ -180,6 +185,53 @@ export const App: React.FC = () => {
     }
   };
 
+  // 1-Click Enroll into an on-chain trade
+  const handleOneClickEnroll = async (candidate: CandidateTokenState, sizeSol?: number) => {
+    try {
+      const ticketSize = sizeSol || walletConfig?.targetTradeSizeSol || 0.02;
+      const res = await fetch('/api/wallet/one-click-enroll', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          tokenMint: candidate.metadata.mint,
+          symbol: candidate.metadata.symbol,
+          name: candidate.metadata.name,
+          sizeSol: ticketSize,
+          priceSol: candidate.micro.priceSol,
+          priceUsd: candidate.micro.priceUsd,
+          slippageBps: Math.round((walletConfig?.maxSlippagePct || 2.0) * 100),
+        }),
+      });
+      const data = await res.json();
+      fetchState();
+      return data;
+    } catch (err: any) {
+      console.error('One-click enroll error', err);
+      return { success: false, error: err.message || 'Enrollment request failed' };
+    }
+  };
+
+  // 1-Click Exit (Market Sell) from an active position
+  const handleOneClickExit = async (positionId: string, pct: 100 | 50) => {
+    try {
+      const res = await fetch('/api/wallet/one-click-exit', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          positionId,
+          pctToExit: pct,
+          slippageBps: Math.round((walletConfig?.maxSlippagePct || 2.5) * 100),
+        }),
+      });
+      const data = await res.json();
+      fetchState();
+      return data;
+    } catch (err: any) {
+      console.error('One-click exit error', err);
+      return { success: false, error: err.message || 'Exit request failed' };
+    }
+  };
+
   // Open Real Money Trade Modal
   const handleOpenRealTradeModal = (
     candOrMint?: CandidateTokenState | string,
@@ -216,7 +268,7 @@ export const App: React.FC = () => {
     setRealTradeModalOpen(true);
   };
 
-  // Mirror an active paper position with real wallet funds
+  // Mirror trade with real wallet funds
   const handleMirrorRealTrade = (pos: Position) => {
     setTradeModalCandidate(null);
     setTradeModalMint(pos.tokenMint);
@@ -389,8 +441,13 @@ export const App: React.FC = () => {
 
       {/* Main Container */}
       <main className="flex-1 max-w-7xl w-full mx-auto p-4 lg:p-6 flex flex-col">
-        {/* Quantitative Portfolio KPI Cards */}
-        <PortfolioOverview portfolio={portfolio} riskLimits={riskLimits} />
+        {/* Quantitative Portfolio KPI Cards (Live vs Paper Dual View) */}
+        <PortfolioOverview
+          portfolio={portfolio}
+          livePortfolio={livePortfolio}
+          riskLimits={riskLimits}
+          walletConfig={walletConfig}
+        />
 
         {/* Navigation Tabs */}
         <div className="flex items-center gap-1.5 border-b border-zinc-800 mb-5 overflow-x-auto pb-1 text-xs font-mono">
@@ -515,9 +572,10 @@ export const App: React.FC = () => {
                 <div className="lg:col-span-7 flex flex-col gap-5">
                   <ActivePositions
                     positions={activePositions}
+                    closedPositions={closedPositions}
                     onManualClose={handleManualClosePosition}
                     onTradeExit={handleTradeExit}
-                    onMirrorRealTrade={handleMirrorRealTrade}
+                    onOneClickExit={handleOneClickExit}
                     onNewRealTrade={() => handleOpenRealTradeModal()}
                   />
                   <LiveScanner
@@ -527,6 +585,7 @@ export const App: React.FC = () => {
                       setSelectedMicroCandidate(cand);
                     }}
                     onRealBuy={handleOpenRealTradeModal}
+                    onOneClickEnroll={handleOneClickEnroll}
                   />
                 </div>
 

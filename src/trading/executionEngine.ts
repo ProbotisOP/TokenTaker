@@ -19,7 +19,7 @@ export interface ExecutionRequest {
 }
 
 export interface ExecutionReceipt {
-  txSignature: string;
+  txSignature?: string;
   status: TradeStatus;
   sizeTokens: number;
   actualPriceSol: number;
@@ -124,8 +124,6 @@ export class ExecutionEngine {
     const sizeTokens = Math.floor(request.sizeSol / actualPriceSol);
     const priorityFeeSol = (preCheck.priorityFeeMicroLamports * 200_000) / 1e15 + preCheck.jitoTipSol;
 
-    const signature = this.generateSimulatedTxSignature();
-
     const latencyBreakdown: LatencyBreakdown = {
       detected_at: request.detected_at,
       parsed_at: request.parsed_at,
@@ -139,7 +137,7 @@ export class ExecutionEngine {
     };
 
     return {
-      txSignature: signature,
+      txSignature: undefined,
       status: TradeStatus.CONFIRMED,
       sizeTokens,
       actualPriceSol,
@@ -161,7 +159,7 @@ export class ExecutionEngine {
     poolLiquiditySol: number,
     isEmergency: boolean = false
   ): {
-    txSignature: string;
+    txSignature?: string;
     actualPriceSol: number;
     solReceived: number;
     feesPaidSol: number;
@@ -174,7 +172,7 @@ export class ExecutionEngine {
     const feesPaidSol = 0.0015;
 
     return {
-      txSignature: this.generateSimulatedTxSignature(),
+      txSignature: undefined,
       actualPriceSol,
       solReceived,
       feesPaidSol,

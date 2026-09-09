@@ -1,7 +1,7 @@
 import React, { useState } from 'react';
 import {
-  ShieldAlert,
   ArrowUpRight,
+  ArrowDownRight,
   Clock,
   Crosshair,
   TrendingUp,
@@ -11,164 +11,388 @@ import {
   Sliders,
   Wallet,
   ExternalLink,
-  HelpCircle,
-  Sparkles,
   Zap,
+  Loader2,
+  Copy,
+  Check,
+  Flame,
 } from 'lucide-react';
 import { Position } from '../types.ts';
 
 interface ActivePositionsProps {
   positions: Position[];
+  closedPositions?: Position[];
   onManualClose: (positionId: string) => void;
   onTradeExit?: (positionId: string, action: 'FLATTEN_100' | 'SCALE_OUT_50' | 'BREAKEVEN_SL' | 'CUSTOM_SL_TP', customSl?: number, customTp?: number) => void;
-  onMirrorRealTrade?: (position: Position) => void;
+  onOneClickExit?: (positionId: string, pct: 100 | 50) => Promise<any> | void;
   onNewRealTrade?: () => void;
 }
 
 export const ActivePositions: React.FC<ActivePositionsProps> = ({
   positions,
+  closedPositions = [],
   onManualClose,
   onTradeExit,
-  onMirrorRealTrade,
+  onOneClickExit,
   onNewRealTrade,
 }) => {
+  const [activeTab, setActiveTab] = useState<'ACTIVE' | 'CLOSED'>('ACTIVE');
   const [editingId, setEditingId] = useState<string | null>(null);
   const [customSl, setCustomSl] = useState<number>(-12);
   const [customTp, setCustomTp] = useState<number>(50);
-  const [filter, setFilter] = useState<'ALL' | 'REAL_WALLET' | 'PAPER_SIM'>('ALL');
-  const [showExplainerModal, setShowExplainerModal] = useState(false);
+  const [exitingId, setExitingId] = useState<string | null>(null);
+  const [exitFeedback, setExitFeedback] = useState<{ positionId: string; message: string; txSig?: string; explorerUrl?: string } | null>(null);
+  const [copiedMint, setCopiedMint] = useState<string | null>(null);
 
-  const handleAction = (positionId: string, action: 'FLATTEN_100' | 'SCALE_OUT_50' | 'BREAKEVEN_SL' | 'CUSTOM_SL_TP') => {
-    if (onTradeExit) {
-      onTradeExit(positionId, action, customSl, customTp);
-    } else {
-      onManualClose(positionId);
+  const handle1ClickExit = async (positionId: string, pct: 100 | 50) => {
+    setExitingId(positionId);
+    setExitFeedback(null);
+    try {
+      if (onOneClickExit) {
+        const res = await onOneClickExit(positionId, pct);
+        if (res && res.success) {
+          setExitFeedback({
+            positionId,
+            message: res.message || `Closed on-chain for ${res.solReceived?.toFixed(4) || ''} SOL`,
+            txSig: res.txSignature,
+            explorerUrl: res.explorerUrl,
+          });
+        }
+      } else if (onTradeExit) {
+        onTradeExit(positionId, pct === 100 ? 'FLATTEN_100' : 'SCALE_OUT_50', customSl, customTp);
+      } else {
+        onManualClose(positionId);
+      }
+    } catch (err: any) {
+      setExitFeedback({
+        positionId,
+        message: err.message || 'Exit failed',
+      });
+    } finally {
+      setExitingId(null);
     }
   };
 
-  const realWalletCount = positions.filter((p) => p.isRealWalletTrade).length;
-  const paperSimCount = positions.filter((p) => !p.isRealWalletTrade).length;
-
-  const filteredPositions = positions.filter((p) => {
-    if (filter === 'REAL_WALLET') return p.isRealWalletTrade;
-    if (filter === 'PAPER_SIM') return !p.isRealWalletTrade;
-    return true;
-  });
+  const handleAction = (positionId: string, action: 'BREAKEVEN_SL' | 'CUSTOM_SL_TP') => {
+    if (onTradeExit) {
+      onTradeExit(positionId, action, customSl, customTp);
+    }
+  };
 
   return (
     <div className="bg-zinc-900/60 border border-zinc-800 rounded-lg overflow-hidden flex flex-col h-full">
       {/* Header */}
       <div className="px-4 py-3 border-b border-zinc-800 flex flex-col sm:flex-row sm:items-center justify-between gap-2 bg-zinc-950/40">
         <div className="flex items-center gap-2">
-          <Crosshair className="w-4 h-4 text-emerald-400" />
-          <h2 className="text-xs font-mono font-bold uppercase tracking-wider text-zinc-200">
-            Autonomous Position Manager ({filteredPositions.length} Active)
-          </h2>
-          <button
-            onClick={() => setShowExplainerModal(true)}
-            className="text-[11px] font-mono text-cyan-400 hover:text-cyan-300 flex items-center gap-1 bg-cyan-950/40 hover:bg-cyan-900/50 px-2 py-0.5 rounded border border-cyan-800/60 transition"
-            title="Why did trade appear in Live Monitor?"
-          >
-            <HelpCircle className="w-3 h-3" />
-            <span>Why trades appear here?</span>
-          </button>
-
-          {onNewRealTrade && (
+          {/* Tabs: Active vs Completed */}
+          <div className="flex items-center gap-1 bg-zinc-900 border border-zinc-800 rounded p-0.5">
             <button
-              onClick={onNewRealTrade}
-              className="text-[11px] font-mono text-emerald-300 hover:text-emerald-200 flex items-center gap-1 bg-emerald-950/80 hover:bg-emerald-900 px-2.5 py-0.5 rounded border border-emerald-600/60 transition font-bold"
-              title="Open Real Money Trade order modal"
+              onClick={() => setActiveTab('ACTIVE')}
+              className={`px-2.5 py-1 rounded text-xs font-mono font-bold transition flex items-center gap-1.5 ${
+                activeTab === 'ACTIVE'
+                  ? 'bg-emerald-950 text-emerald-300 border border-emerald-500/80 shadow-sm'
+                  : 'text-zinc-400 hover:text-zinc-200'
+              }`}
             >
-              <Zap className="w-3 h-3 text-emerald-400 fill-current" />
-              <span>+ New Real Trade</span>
+              <Crosshair className="w-3.5 h-3.5 text-emerald-400" />
+              <span>Active ({positions.length})</span>
             </button>
-          )}
+            <button
+              onClick={() => setActiveTab('CLOSED')}
+              className={`px-2.5 py-1 rounded text-xs font-mono font-bold transition flex items-center gap-1.5 ${
+                activeTab === 'CLOSED'
+                  ? 'bg-zinc-800 text-zinc-100 border border-zinc-600 shadow-sm'
+                  : 'text-zinc-400 hover:text-zinc-200'
+              }`}
+            >
+              <Clock className="w-3.5 h-3.5 text-zinc-400" />
+              <span>Completed ({closedPositions.length})</span>
+            </button>
+          </div>
+
+          <span className="px-2 py-0.5 rounded text-[10px] font-mono font-bold bg-emerald-950/80 text-emerald-300 border border-emerald-500/50 flex items-center gap-1 hidden sm:flex">
+            <Wallet className="w-3 h-3 text-emerald-400" />
+            <span>SOLANA ON-CHAIN</span>
+          </span>
         </div>
 
-        {/* Filter Toggle: All vs Real Wallet vs Paper Engine */}
-        <div className="flex items-center gap-1 text-[11px] font-mono">
+        {onNewRealTrade && (
           <button
-            onClick={() => setFilter('ALL')}
-            className={`px-2 py-1 rounded transition ${
-              filter === 'ALL'
-                ? 'bg-zinc-800 text-zinc-100 font-bold border border-zinc-700'
-                : 'text-zinc-500 hover:text-zinc-300'
-            }`}
+            onClick={onNewRealTrade}
+            className="text-[11px] font-mono text-emerald-300 hover:text-emerald-200 flex items-center gap-1 bg-emerald-950/80 hover:bg-emerald-900 px-2.5 py-1 rounded border border-emerald-600/60 transition font-bold"
+            title="Open Real Money Trade order modal"
           >
-            All ({positions.length})
+            <Zap className="w-3 h-3 text-emerald-400 fill-current" />
+            <span>+ 1-Click Enroll</span>
           </button>
-          <button
-            onClick={() => setFilter('REAL_WALLET')}
-            className={`px-2 py-1 rounded flex items-center gap-1 transition ${
-              filter === 'REAL_WALLET'
-                ? 'bg-emerald-950 text-emerald-300 font-bold border border-emerald-700'
-                : 'text-zinc-500 hover:text-emerald-400'
-            }`}
-          >
-            <Wallet className="w-3 h-3" />
-            <span>Real Wallet ({realWalletCount})</span>
-          </button>
-          <button
-            onClick={() => setFilter('PAPER_SIM')}
-            className={`px-2 py-1 rounded transition ${
-              filter === 'PAPER_SIM'
-                ? 'bg-zinc-800 text-amber-300 font-bold border border-amber-600/50'
-                : 'text-zinc-500 hover:text-zinc-300'
-            }`}
-          >
-            Paper Sim ({paperSimCount})
-          </button>
-        </div>
+        )}
       </div>
 
-      {/* Position Cards / Table */}
-      <div className="divide-y divide-zinc-800/70 overflow-y-auto max-h-[480px]">
-        {filteredPositions.length === 0 ? (
-          <div className="p-8 text-center text-xs font-mono text-zinc-500 space-y-2">
-            {filter === 'REAL_WALLET' ? (
-              <div className="max-w-md mx-auto space-y-2 text-zinc-400">
-                <div className="w-8 h-8 rounded-full bg-zinc-800 flex items-center justify-center mx-auto text-amber-400">
-                  <Wallet className="w-4 h-4" />
-                </div>
-                <div className="font-bold text-zinc-200">No Real Wallet Trades Active Yet</div>
-                <p className="text-[11px] text-zinc-500 leading-relaxed">
-                  Your connected wallet funds are completely safe and untouched. To execute trades using your allocated SOL capital, switch to the <strong>Real Wallet &amp; Autotrade</strong> tab.
-                </p>
+      {/* Exit Feedback Notification */}
+      {exitFeedback && (
+        <div className="mx-4 mt-3 p-3 rounded-lg bg-emerald-950/80 border border-emerald-500 text-xs font-mono flex items-center justify-between">
+          <div className="flex items-center gap-2 text-emerald-200">
+            <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
+            <span>{exitFeedback.message}</span>
+          </div>
+          {exitFeedback.txSig && (
+            <a
+              href={exitFeedback.explorerUrl || `https://solscan.io/tx/${exitFeedback.txSig}`}
+              target="_blank"
+              rel="noreferrer"
+              className="text-emerald-300 hover:text-white underline font-bold flex items-center gap-1 ml-3 shrink-0"
+            >
+              <span>View Solscan</span>
+              <ExternalLink className="w-3 h-3" />
+            </a>
+          )}
+        </div>
+      )}
+
+      {/* Position Cards */}
+      <div className="divide-y divide-zinc-800/70 overflow-y-auto max-h-[500px]">
+        {activeTab === 'CLOSED' ? (
+          closedPositions.length === 0 ? (
+            <div className="p-8 text-center text-xs font-mono text-zinc-500 space-y-2">
+              <div className="w-10 h-10 rounded-full bg-zinc-800/80 border border-zinc-700 flex items-center justify-center mx-auto text-zinc-400">
+                <Clock className="w-5 h-5" />
               </div>
-            ) : (
-              <div>No active positions. Capital preserved in cash. Autonomous engine scanning for qualifying edge.</div>
+              <div className="font-bold text-zinc-300 text-sm">No Completed Trades Yet</div>
+              <p className="text-[11px] text-zinc-400 max-w-md mx-auto leading-relaxed">
+                When an on-chain position is closed manually with <strong>1-Click Exit</strong> or via Stop Loss / Take Profit targets, its complete audit receipt, return breakdown, and Solscan transactions will be saved here permanently.
+              </p>
+            </div>
+          ) : (
+            closedPositions.map((p) => {
+              const realizedPnl = p.realizedPnlSol ?? 0;
+              const isPnlPositive = realizedPnl >= 0;
+              const costBasis = p.costBasisSol || 0.0001;
+              const realizedPct = Number(((realizedPnl / costBasis) * 100).toFixed(1));
+              const returnedSol = Math.max(0, costBasis + realizedPnl);
+              const buyTx = p.txSignature || p.executionHistory?.find((e) => e.action === 'BUY' || e.action === 'ENTRY')?.txSignature;
+              const sellTx = p.exitTxSignature || p.executionHistory?.find((e) => e.action === 'SELL')?.txSignature;
+              const closedTimeStr = p.closedAt ? new Date(p.closedAt).toLocaleTimeString() : 'Recently';
+
+              let exitReasonDisplay = '⚡ 1-Click Market Exit';
+              if (p.exitReason) {
+                if (p.exitReason === '1_CLICK_MARKET_EXIT') exitReasonDisplay = '⚡ 1-Click Market Exit';
+                else if (p.exitReason.includes('HARD_STOP')) exitReasonDisplay = '🛡️ Hard Stop Loss (-12%)';
+                else if (p.exitReason.includes('TAKE_PROFIT')) exitReasonDisplay = '🎯 Take Profit Target';
+                else if (p.exitReason.includes('TRAILING_STOP')) exitReasonDisplay = '📈 Trailing Stop Activated';
+                else if (p.exitReason.includes('RECLAIM')) exitReasonDisplay = '🔄 Manual SOL Reclaim';
+                else exitReasonDisplay = p.exitReason;
+              }
+
+              return (
+                <div key={p.id} className="p-4 hover:bg-zinc-800/20 transition flex flex-col gap-3 bg-zinc-950/20">
+                  {/* Top Row: Token Info & Realized PnL */}
+                  <div className="flex items-start justify-between gap-3">
+                    <div>
+                      <div className="flex items-center gap-2 flex-wrap">
+                        <span className="font-mono font-bold text-sm text-zinc-100">${p.symbol}</span>
+                        <span className="text-xs text-zinc-400">{p.name}</span>
+
+                        {/* CA Badge */}
+                        {p.tokenMint && (
+                          <div className="flex items-center gap-1 bg-zinc-950/90 border border-zinc-800 rounded px-1.5 py-0.5 text-[10px] font-mono text-zinc-400">
+                            <span className="text-zinc-500 font-bold">CA:</span>
+                            <span className="text-zinc-300">{p.tokenMint.slice(0, 4)}...{p.tokenMint.slice(-4)}</span>
+                            <button
+                              type="button"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                navigator.clipboard.writeText(p.tokenMint);
+                                setCopiedMint(p.tokenMint);
+                                setTimeout(() => setCopiedMint(null), 1800);
+                              }}
+                              className="hover:text-emerald-400 p-0.5 transition"
+                              title="Copy contract address"
+                            >
+                              {copiedMint === p.tokenMint ? (
+                                <Check className="w-3 h-3 text-emerald-400" />
+                              ) : (
+                                <Copy className="w-3 h-3" />
+                              )}
+                            </button>
+                            <a
+                              href={`https://solscan.io/token/${p.tokenMint}`}
+                              target="_blank"
+                              rel="noreferrer"
+                              className="text-zinc-500 hover:text-cyan-400 p-0.5 transition"
+                              title="Solscan token page"
+                            >
+                              <ExternalLink className="w-3 h-3" />
+                            </a>
+                            <a
+                              href={`https://dexscreener.com/solana/${p.tokenMint}`}
+                              target="_blank"
+                              rel="noreferrer"
+                              className="text-zinc-500 hover:text-amber-400 p-0.5 transition"
+                              title="DexScreener chart"
+                            >
+                              <Flame className="w-3 h-3 text-amber-500" />
+                            </a>
+                          </div>
+                        )}
+
+                        <span className="px-2 py-0.5 rounded text-[10px] font-mono font-bold bg-zinc-800 text-zinc-300 border border-zinc-700 flex items-center gap-1">
+                          <CheckCircle2 className="w-3 h-3 text-emerald-400" />
+                          <span>CLOSED</span>
+                        </span>
+
+                        <span className="text-[11px] font-mono text-zinc-500 flex items-center gap-1">
+                          <Clock className="w-3 h-3" />
+                          <span>Closed at {closedTimeStr} ({p.holdingSec || 0}s held)</span>
+                        </span>
+                      </div>
+
+                      {/* Trade details & Exit Reason */}
+                      <div className="text-xs font-mono text-zinc-400 mt-1 flex items-center gap-2 flex-wrap">
+                        <span className="text-zinc-300 bg-zinc-900 border border-zinc-800 px-2 py-0.5 rounded text-[10px]">
+                          {exitReasonDisplay}
+                        </span>
+                        <span>&bull;</span>
+                        <span>Invested: <strong className="text-zinc-200">{costBasis.toFixed(4)} SOL</strong></span>
+                        <span>&rarr;</span>
+                        <span>Returned: <strong className="text-emerald-300 font-bold">{returnedSol.toFixed(4)} SOL</strong></span>
+                        <span className="px-1.5 py-0.5 rounded text-[10px] bg-emerald-950/60 text-emerald-300 border border-emerald-800/60 font-semibold">
+                          Deposited to Phantom
+                        </span>
+                      </div>
+                    </div>
+
+                    {/* Realized PnL badge */}
+                    <div className="text-right shrink-0">
+                      <div className={`text-base font-mono font-bold flex items-center justify-end gap-0.5 ${isPnlPositive ? 'text-emerald-400' : 'text-rose-400'}`}>
+                        {isPnlPositive ? <ArrowUpRight className="w-4 h-4" /> : <ArrowDownRight className="w-4 h-4" />}
+                        <span>{isPnlPositive ? '+' : ''}{realizedPct}%</span>
+                      </div>
+                      <div className={`text-xs font-mono font-semibold ${isPnlPositive ? 'text-emerald-400/90' : 'text-rose-400/90'}`}>
+                        {isPnlPositive ? '+' : ''}{realizedPnl.toFixed(5)} SOL
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* Solscan Tx Links Row */}
+                  <div className="flex items-center gap-3 pt-2 border-t border-zinc-800/60 text-[11px] font-mono flex-wrap">
+                    {buyTx && (
+                      <a
+                        href={`https://solscan.io/tx/${buyTx}`}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="text-cyan-400 hover:text-cyan-300 hover:underline flex items-center gap-1 bg-cyan-950/40 border border-cyan-800/50 px-2 py-0.5 rounded transition"
+                      >
+                        <span>Entry Buy Tx</span>
+                        <ExternalLink className="w-3 h-3" />
+                      </a>
+                    )}
+                    {sellTx && (
+                      <a
+                        href={`https://solscan.io/tx/${sellTx}`}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="text-emerald-400 hover:text-emerald-300 hover:underline flex items-center gap-1 bg-emerald-950/40 border border-emerald-800/50 px-2 py-0.5 rounded font-bold transition"
+                      >
+                        <Wallet className="w-3 h-3" />
+                        <span>Exit Swap Tx (SOL Returned)</span>
+                        <ExternalLink className="w-3 h-3" />
+                      </a>
+                    )}
+                    <span className="text-zinc-500 text-[10px] ml-auto">
+                      Tokens: {p.sizeTokens.toLocaleString()}
+                    </span>
+                  </div>
+                </div>
+              );
+            })
+          )
+        ) : positions.length === 0 ? (
+          <div className="p-8 text-center text-xs font-mono text-zinc-500 space-y-2">
+            <div className="w-10 h-10 rounded-full bg-zinc-800/80 border border-zinc-700 flex items-center justify-center mx-auto text-emerald-400">
+              <Wallet className="w-5 h-5" />
+            </div>
+            <div className="font-bold text-zinc-300 text-sm">No Active On-Chain Positions</div>
+            <p className="text-[11px] text-zinc-400 max-w-md mx-auto leading-relaxed">
+              Your Solana wallet balance is fully liquid and held safely. Use <strong>⚡ 1-Click Real Buy</strong> in the Scanner to instantly enroll into detected memecoins on-chain.
+            </p>
+            {closedPositions.length > 0 && (
+              <div className="pt-2">
+                <button
+                  onClick={() => setActiveTab('CLOSED')}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded bg-zinc-800 hover:bg-zinc-700 text-emerald-400 hover:text-emerald-300 text-xs font-mono font-bold transition border border-zinc-700"
+                >
+                  <Clock className="w-3.5 h-3.5" />
+                  <span>View {closedPositions.length} Completed Trade{closedPositions.length > 1 ? 's' : ''} &rarr;</span>
+                </button>
+              </div>
             )}
           </div>
         ) : (
-          filteredPositions.map((p) => {
+          positions.map((p) => {
             const isPnlPositive = p.unrealizedPnlSol >= 0;
             const txSig = p.executionHistory?.[0]?.txSignature;
+            const isThisExiting = exitingId === p.id;
 
             return (
               <div key={p.id} className="p-4 hover:bg-zinc-800/30 transition flex flex-col gap-3">
-                {/* Top Row: Token, Source Badge, PnL, Actions */}
+                {/* Top Row: Token, Address, PnL, 1-Click Exit Buttons */}
                 <div className="flex items-start justify-between gap-3">
                   <div>
                     <div className="flex items-center gap-2 flex-wrap">
                       <span className="font-mono font-bold text-sm text-zinc-100">${p.symbol}</span>
                       <span className="text-xs text-zinc-400">{p.name}</span>
 
-                      {/* Source attribution badge */}
-                      {p.isRealWalletTrade ? (
-                        <span className="px-2 py-0.5 rounded text-[10px] font-mono font-bold bg-emerald-950 text-emerald-300 border border-emerald-500/50 flex items-center gap-1 shadow-sm">
-                          <Wallet className="w-3 h-3 text-emerald-400" />
-                          <span>REAL WALLET SOL</span>
-                          {p.walletAddress && (
-                            <span className="text-[9px] text-emerald-400/80">
-                              ({p.walletAddress.slice(0, 4)}...{p.walletAddress.slice(-4)})
-                            </span>
-                          )}
-                        </span>
-                      ) : (
-                        <span className="px-2 py-0.5 rounded text-[10px] font-mono font-medium bg-zinc-950 text-zinc-400 border border-zinc-800">
-                          PAPER SIMULATION
-                        </span>
+                      {/* Verified Solana Contract Badge */}
+                      {p.tokenMint && (
+                        <div className="flex items-center gap-1 bg-zinc-950/90 border border-zinc-800 hover:border-zinc-700 rounded px-1.5 py-0.5 text-[10px] font-mono text-zinc-400">
+                          <span className="text-zinc-500 font-bold">CA:</span>
+                          <span className="text-zinc-200" title={p.tokenMint}>
+                            {p.tokenMint.slice(0, 4)}...{p.tokenMint.slice(-4)}
+                          </span>
+                          <button
+                            type="button"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              navigator.clipboard.writeText(p.tokenMint);
+                              setCopiedMint(p.tokenMint);
+                              setTimeout(() => setCopiedMint(null), 1800);
+                            }}
+                            className="hover:text-emerald-400 p-0.5 transition"
+                            title="Copy verified contract address to clipboard"
+                          >
+                            {copiedMint === p.tokenMint ? (
+                              <Check className="w-3 h-3 text-emerald-400" />
+                            ) : (
+                              <Copy className="w-3 h-3" />
+                            )}
+                          </button>
+                          <a
+                            href={`https://solscan.io/token/${p.tokenMint}`}
+                            target="_blank"
+                            rel="noreferrer"
+                            onClick={(e) => e.stopPropagation()}
+                            className="text-zinc-500 hover:text-cyan-400 p-0.5 transition flex items-center"
+                            title="Verify token contract on Solscan"
+                          >
+                            <ExternalLink className="w-3 h-3" />
+                          </a>
+                          <a
+                            href={`https://dexscreener.com/solana/${p.tokenMint}`}
+                            target="_blank"
+                            rel="noreferrer"
+                            onClick={(e) => e.stopPropagation()}
+                            className="text-zinc-500 hover:text-amber-400 p-0.5 transition flex items-center"
+                            title="Open live chart on DexScreener"
+                          >
+                            <Flame className="w-3 h-3 text-amber-500" />
+                          </a>
+                        </div>
                       )}
+
+                      <span className="px-2 py-0.5 rounded text-[10px] font-mono font-bold bg-emerald-950 text-emerald-300 border border-emerald-500/50 flex items-center gap-1 shadow-sm">
+                        <Wallet className="w-3 h-3 text-emerald-400" />
+                        <span>PHANTOM SYNCED</span>
+                      </span>
 
                       <span className="text-[11px] font-mono text-zinc-500 flex items-center gap-1">
                         <Clock className="w-3 h-3" />
@@ -196,16 +420,17 @@ export const ActivePositions: React.FC<ActivePositionsProps> = ({
                           href={`https://solscan.io/tx/${txSig}`}
                           target="_blank"
                           rel="noreferrer"
-                          className="text-[10px] text-cyan-400 hover:text-cyan-300 flex items-center gap-0.5 underline"
+                          className="text-[10px] text-emerald-400 hover:text-emerald-300 flex items-center gap-0.5 underline font-bold"
+                          title="Verify real trade on Solana Explorer"
                         >
-                          <span>Solscan</span>
+                          <span>Solscan Verified</span>
                           <ExternalLink className="w-2.5 h-2.5" />
                         </a>
                       )}
                     </div>
                   </div>
 
-                  {/* PnL & Granular Per-Trade Exit Options */}
+                  {/* PnL & 1-Click Real Market Exit Buttons */}
                   <div className="flex flex-col sm:flex-row items-end sm:items-center gap-3">
                     <div className="text-right">
                       <div className={`text-base font-mono font-bold ${isPnlPositive ? 'text-emerald-400' : 'text-rose-400'}`}>
@@ -214,47 +439,41 @@ export const ActivePositions: React.FC<ActivePositionsProps> = ({
                       </div>
                       <div className={`text-xs font-mono ${isPnlPositive ? 'text-emerald-400/80' : 'text-rose-400/80'}`}>
                         {isPnlPositive ? '+' : ''}
-                        {p.unrealizedPnlSol.toFixed(3)} SOL
+                        {p.unrealizedPnlSol.toFixed(4)} SOL
                       </div>
                     </div>
 
                     <div className="flex items-center gap-1.5 flex-wrap">
-                      {/* Mirror with Real Money */}
-                      {onMirrorRealTrade && !p.isRealWalletTrade && (
-                        <button
-                          onClick={() => onMirrorRealTrade(p)}
-                          className="px-2.5 py-1 rounded bg-emerald-500 hover:bg-emerald-400 text-zinc-950 text-xs font-mono font-bold transition flex items-center gap-1 shadow-sm"
-                          title="Mirror this simulation trade using real Solana wallet"
-                        >
-                          <Zap className="w-3 h-3 fill-current" />
-                          <span>Mirror Real Trade</span>
-                        </button>
-                      )}
-
-                      {/* 100% Exit */}
+                      {/* ⚡ 1-Click Market Exit (100%) */}
                       <button
-                        onClick={() => handleAction(p.id, 'FLATTEN_100')}
-                        className="px-2 py-1 rounded bg-rose-950/60 hover:bg-rose-900 text-rose-200 text-xs font-mono font-semibold transition border border-rose-700/50 flex items-center gap-1"
-                        title="Instant 100% market dump"
+                        onClick={() => handle1ClickExit(p.id, 100)}
+                        disabled={isThisExiting}
+                        className="px-2.5 py-1.5 rounded bg-rose-600 hover:bg-rose-500 disabled:opacity-50 text-white text-xs font-mono font-bold transition flex items-center gap-1 shadow-sm"
+                        title="Instant on-chain market swap back to SOL via Jupiter DEX"
                       >
-                        <ShieldAlert className="w-3 h-3" />
-                        <span>Exit 100%</span>
+                        {isThisExiting ? (
+                          <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                        ) : (
+                          <Zap className="w-3.5 h-3.5 fill-current" />
+                        )}
+                        <span>⚡ 1-Click Exit 100%</span>
                       </button>
 
-                      {/* 50% Scale-Out */}
+                      {/* ⚡ Scale Out 50% */}
                       <button
-                        onClick={() => handleAction(p.id, 'SCALE_OUT_50')}
-                        className="px-2 py-1 rounded bg-emerald-950/60 hover:bg-emerald-900 text-emerald-200 text-xs font-mono font-semibold transition border border-emerald-700/50 flex items-center gap-1"
-                        title="Take profit on 50%, keep 50% runner"
+                        onClick={() => handle1ClickExit(p.id, 50)}
+                        disabled={isThisExiting}
+                        className="px-2 py-1.5 rounded bg-emerald-950 hover:bg-emerald-900 disabled:opacity-50 text-emerald-200 text-xs font-mono font-bold transition border border-emerald-700/60 flex items-center gap-1"
+                        title="Swap 50% of tokens back to SOL on-chain, keep runner"
                       >
-                        <TrendingUp className="w-3 h-3" />
+                        <TrendingUp className="w-3 h-3 text-emerald-400" />
                         <span>Scale 50%</span>
                       </button>
 
                       {/* Breakeven SL */}
                       <button
                         onClick={() => handleAction(p.id, 'BREAKEVEN_SL')}
-                        className="px-2 py-1 rounded bg-cyan-950/60 hover:bg-cyan-900 text-cyan-200 text-xs font-mono font-semibold transition border border-cyan-700/50 flex items-center gap-1"
+                        className="px-2 py-1.5 rounded bg-cyan-950/60 hover:bg-cyan-900 text-cyan-200 text-xs font-mono font-semibold transition border border-cyan-700/50 flex items-center gap-1"
                         title="Move stop loss to entry (zero risk)"
                       >
                         <Lock className="w-3 h-3" />
@@ -264,7 +483,7 @@ export const ActivePositions: React.FC<ActivePositionsProps> = ({
                       {/* Custom SL */}
                       <button
                         onClick={() => setEditingId(editingId === p.id ? null : p.id)}
-                        className="px-2 py-1 rounded bg-zinc-800 hover:bg-zinc-700 text-zinc-300 text-xs font-mono font-semibold transition border border-zinc-700 flex items-center gap-1"
+                        className="px-2 py-1.5 rounded bg-zinc-800 hover:bg-zinc-700 text-zinc-300 text-xs font-mono font-semibold transition border border-zinc-700 flex items-center gap-1"
                         title="Edit SL % specifically for this trade"
                       >
                         <Sliders className="w-3 h-3" />
@@ -274,10 +493,10 @@ export const ActivePositions: React.FC<ActivePositionsProps> = ({
                   </div>
                 </div>
 
-                {/* Inline SL/TP Editor if expanded */}
+                {/* Inline SL Editor if open */}
                 {editingId === p.id && (
                   <div className="p-3 bg-zinc-950 border border-zinc-700 rounded flex items-center gap-3 text-xs font-mono">
-                    <span className="text-zinc-400">Stop Loss %:</span>
+                    <span className="text-zinc-400">Custom Stop Loss %:</span>
                     <input
                       type="number"
                       max="-1"
@@ -304,9 +523,8 @@ export const ActivePositions: React.FC<ActivePositionsProps> = ({
                   </div>
                 )}
 
-                {/* Bottom Row: Trailing Stop & Scale-out ladder status */}
+                {/* Trailing Stop & Take Profit Status */}
                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 text-xs font-mono bg-zinc-950/50 p-2.5 rounded border border-zinc-800/80">
-                  {/* Trailing Stop Visualizer */}
                   <div>
                     <div className="text-[11px] text-zinc-500 mb-1 flex items-center justify-between">
                       <span>Trailing Stop (14% Band):</span>
@@ -322,7 +540,6 @@ export const ActivePositions: React.FC<ActivePositionsProps> = ({
                     </div>
                   </div>
 
-                  {/* Take Profit Ladder */}
                   <div>
                     <div className="text-[11px] text-zinc-500 mb-1 flex items-center gap-1">
                       <TrendingUp className="w-3 h-3 text-cyan-400" />
@@ -356,60 +573,6 @@ export const ActivePositions: React.FC<ActivePositionsProps> = ({
           })
         )}
       </div>
-
-      {/* Explainer Modal: Why did trades show in Live Monitor? */}
-      {showExplainerModal && (
-        <div className="fixed inset-0 bg-black/85 backdrop-blur-md z-50 flex items-center justify-center p-4">
-          <div className="bg-zinc-900 border border-zinc-700 rounded-2xl max-w-lg w-full p-6 shadow-2xl space-y-4 font-mono">
-            <div className="flex items-start justify-between">
-              <div className="flex items-center gap-2 text-cyan-400">
-                <Sparkles className="w-5 h-5" />
-                <h3 className="text-sm font-bold uppercase tracking-wider text-zinc-100">
-                  Understanding Live Monitor vs. Your Real Wallet
-                </h3>
-              </div>
-              <button
-                onClick={() => setShowExplainerModal(false)}
-                className="text-zinc-400 hover:text-zinc-200 text-lg p-1"
-              >
-                &times;
-              </button>
-            </div>
-
-            <div className="space-y-3 text-xs text-zinc-300 leading-relaxed">
-              <div className="p-3 rounded-xl bg-zinc-950 border border-zinc-800 space-y-1">
-                <div className="text-amber-300 font-bold">1. Did the bot trade my real wallet SOL?</div>
-                <p className="text-zinc-400 text-[11px]">
-                  <strong>No.</strong> Your real connected wallet SOL ($20) remains safe and untouched in your own custody. The trades labeled <code>PAPER SIMULATION</code> are executed inside the built-in Quant Mempool Engine with virtual equity to test algorithms without financial risk.
-                </p>
-              </div>
-
-              <div className="p-3 rounded-xl bg-zinc-950 border border-zinc-800 space-y-1">
-                <div className="text-emerald-300 font-bold">2. Why didn't Phantom show a transaction?</div>
-                <p className="text-zinc-400 text-[11px]">
-                  Solana wallet extensions (like Phantom) strictly prohibit any web application from withdrawing or spending SOL without either (a) an explicit on-screen popup signature request, or (b) a dedicated bot signing key. This guarantees your funds can never be silently drained.
-                </p>
-              </div>
-
-              <div className="p-3 rounded-xl bg-zinc-950 border border-zinc-800 space-y-1">
-                <div className="text-cyan-300 font-bold">3. How do I trade my real $20 SOL?</div>
-                <p className="text-zinc-400 text-[11px]">
-                  Go to the <strong>Real Wallet &amp; Autotrade</strong> tab. In Step 3, configure <strong>"How Many SOL to Use"</strong> (e.g. 0.08 SOL) and your <strong>Ticket Size</strong> (e.g. 0.02 SOL per trade). You can execute 1-click test trades or engage automated sniping bounded strictly by your rules.
-                </p>
-              </div>
-            </div>
-
-            <div className="pt-2 border-t border-zinc-800 flex justify-end">
-              <button
-                onClick={() => setShowExplainerModal(false)}
-                className="px-4 py-2 rounded bg-cyan-600 hover:bg-cyan-500 text-white text-xs font-bold transition"
-              >
-                Understood
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
     </div>
   );
 };

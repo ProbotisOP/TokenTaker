@@ -11,6 +11,8 @@ import {
   Lock,
   Flame,
   HelpCircle,
+  Copy,
+  Check,
 } from 'lucide-react';
 import { CandidateTokenState, WalletAutotradeConfig } from '../types.ts';
 
@@ -64,6 +66,7 @@ export const RealTradeOrderModal: React.FC<RealTradeOrderModalProps> = ({
 
   // Wallet Connect inline helpers
   const [isConnecting, setIsConnecting] = useState(false);
+  const [copiedMint, setCopiedMint] = useState(false);
 
   // Sync props when opening
   useEffect(() => {
@@ -174,6 +177,12 @@ export const RealTradeOrderModal: React.FC<RealTradeOrderModalProps> = ({
       setErrorMessage('Please enter a trade size greater than 0 SOL.');
       return;
     }
+    if (!localConfig?.lastPreflightPassed) {
+      setErrorMessage(
+        'LIVE TRADING GATED: Preflight Diagnostic (11 checks) must pass before real on-chain swaps can be submitted. Please run Step 2 in Autotrade Studio.'
+      );
+      return;
+    }
     if (isConnected && tradeSizeSol > maxAvailableToTrade) {
       setErrorMessage(
         `Trade size (${tradeSizeSol} SOL) exceeds available balance minus gas reserve (${maxAvailableToTrade.toFixed(3)} SOL).`
@@ -272,9 +281,44 @@ export const RealTradeOrderModal: React.FC<RealTradeOrderModalProps> = ({
                   Solana Mainnet
                 </span>
               </div>
-              <p className="text-xs text-zinc-400 font-mono truncate max-w-sm">
-                Mint: {tokenMint.slice(0, 8)}...{tokenMint.slice(-6)}
-              </p>
+              <div className="flex items-center gap-1.5 text-xs text-zinc-400 font-mono mt-0.5">
+                <span className="text-zinc-500 font-bold">CA:</span>
+                <span className="text-zinc-300">{tokenMint ? `${tokenMint.slice(0, 6)}...${tokenMint.slice(-6)}` : 'N/A'}</span>
+                {tokenMint && (
+                  <>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        navigator.clipboard.writeText(tokenMint);
+                        setCopiedMint(true);
+                        setTimeout(() => setCopiedMint(false), 1800);
+                      }}
+                      className="hover:text-emerald-400 p-0.5 transition"
+                      title="Copy contract address"
+                    >
+                      {copiedMint ? <Check className="w-3 h-3 text-emerald-400" /> : <Copy className="w-3 h-3" />}
+                    </button>
+                    <a
+                      href={`https://solscan.io/token/${tokenMint}`}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="text-zinc-500 hover:text-cyan-400 p-0.5 transition"
+                      title="Verify on Solscan"
+                    >
+                      <ExternalLink className="w-3 h-3" />
+                    </a>
+                    <a
+                      href={`https://dexscreener.com/solana/${tokenMint}`}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="text-zinc-500 hover:text-amber-400 p-0.5 transition"
+                      title="View on DexScreener"
+                    >
+                      <Flame className="w-3 h-3 text-amber-500" />
+                    </a>
+                  </>
+                )}
+              </div>
             </div>
           </div>
 
@@ -289,55 +333,92 @@ export const RealTradeOrderModal: React.FC<RealTradeOrderModalProps> = ({
         {/* Body */}
         <div className="p-5 overflow-y-auto space-y-4 text-xs font-mono">
           {/* Wallet Status Box */}
-          <div className={`p-3 rounded-lg border flex flex-col sm:flex-row sm:items-center justify-between gap-3 ${
+          <div className={`p-3.5 rounded-lg border flex flex-col gap-2.5 ${
             isConnected
               ? 'bg-zinc-950/80 border-zinc-800 text-zinc-300'
               : 'bg-amber-950/30 border-amber-500/40 text-amber-200'
           }`}>
-            <div className="flex items-start gap-2.5">
-              <Wallet className={`w-4 h-4 mt-0.5 shrink-0 ${isConnected ? 'text-emerald-400' : 'text-amber-400'}`} />
-              <div>
-                <div className="font-bold flex items-center gap-2">
-                  <span>{isConnected ? localConfig.walletName : 'No Solana Wallet Connected'}</span>
-                  {isConnected && (
-                    <span className="text-[10px] text-zinc-500 font-normal">
-                      ({localConfig.walletAddress?.slice(0, 4)}...{localConfig.walletAddress?.slice(-4)})
-                    </span>
-                  )}
-                </div>
-                <div className="text-[11px] text-zinc-400 mt-0.5">
-                  {isConnected ? (
-                    <span>
-                      Live Balance: <strong className="text-emerald-400">{balanceSol.toFixed(4)} SOL</strong> (~${balanceUsd.toFixed(2)}) &bull; Gas Reserve: {gasReserveSol.toFixed(3)} SOL
-                    </span>
-                  ) : (
-                    <span>Connect your wallet to trade with your real SOL funds ($20 starter bag).</span>
-                  )}
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+              <div className="flex items-start gap-2.5">
+                <Wallet className={`w-4 h-4 mt-0.5 shrink-0 ${isConnected ? 'text-emerald-400' : 'text-amber-400'}`} />
+                <div>
+                  <div className="font-bold flex items-center gap-2 flex-wrap">
+                    <span>{isConnected ? localConfig.walletName : 'No Solana Wallet Connected'}</span>
+                    {isConnected && (
+                      <span className="text-[10px] text-zinc-500 font-normal">
+                        ({(localConfig.keypairPublicKey || localConfig.walletAddress)?.slice(0, 4)}...{(localConfig.keypairPublicKey || localConfig.walletAddress)?.slice(-4)})
+                      </span>
+                    )}
+                    {localConfig?.lastPreflightPassed ? (
+                      <span className="px-1.5 py-0.2 rounded bg-emerald-500/10 text-emerald-400 border border-emerald-500/30 text-[10px] font-bold">
+                        PREFLIGHT PASSED
+                      </span>
+                    ) : (
+                      <span className="px-1.5 py-0.2 rounded bg-amber-500/10 text-amber-400 border border-amber-500/30 text-[10px] font-bold">
+                        PREFLIGHT REQUIRED
+                      </span>
+                    )}
+                  </div>
+                  <div className="text-[11px] text-zinc-400 mt-0.5">
+                    {isConnected ? (
+                      <span>
+                        Live Balance: <strong className="text-emerald-400">{balanceSol.toFixed(4)} SOL</strong> (~${balanceUsd.toFixed(2)}) &bull; Gas Reserve: {gasReserveSol.toFixed(3)} SOL
+                      </span>
+                    ) : (
+                      <span>Connect your wallet to trade with your real SOL funds ($20 starter bag).</span>
+                    )}
+                  </div>
                 </div>
               </div>
-            </div>
 
-            {!isConnected && (
-              <div className="flex items-center gap-2 shrink-0">
-                <button
-                  onClick={handleConnectPhantom}
-                  disabled={isConnecting}
-                  className="px-3 py-1.5 rounded bg-emerald-500 hover:bg-emerald-400 text-zinc-950 font-bold transition flex items-center gap-1 text-[11px]"
-                >
-                  <Zap className="w-3 h-3 fill-current" />
-                  <span>{isConnecting ? 'Connecting...' : 'Connect Phantom'}</span>
-                </button>
-                <button
-                  onClick={handleConnectSandbox}
-                  disabled={isConnecting}
-                  className="px-2.5 py-1.5 rounded bg-zinc-800 hover:bg-zinc-700 text-zinc-300 transition text-[10px]"
-                  title="Use 0.12 SOL pre-funded sandbox test wallet"
-                >
-                  Sandbox (0.12 SOL)
-                </button>
-              </div>
-            )}
+              {!isConnected && (
+                <div className="flex items-center gap-2 shrink-0">
+                  <button
+                    onClick={handleConnectPhantom}
+                    disabled={isConnecting}
+                    className="px-3 py-1.5 rounded bg-emerald-500 hover:bg-emerald-400 text-zinc-950 font-bold transition flex items-center gap-1 text-[11px]"
+                  >
+                    <Zap className="w-3 h-3 fill-current" />
+                    <span>{isConnecting ? 'Connecting...' : 'Connect Phantom'}</span>
+                  </button>
+                  <button
+                    onClick={handleConnectSandbox}
+                    disabled={isConnecting}
+                    className="px-2.5 py-1.5 rounded bg-zinc-800 hover:bg-zinc-700 text-zinc-300 transition text-[10px]"
+                    title="Use 0.12 SOL pre-funded sandbox test wallet"
+                  >
+                    Sandbox (0.12 SOL)
+                  </button>
+                </div>
+              )}
+            </div>
           </div>
+
+          {/* Preflight Requirement Banner */}
+          {!localConfig?.lastPreflightPassed && (
+            <div className="p-3 rounded-lg bg-amber-950/40 border border-amber-500/50 flex items-start justify-between gap-3 text-amber-200">
+              <div className="flex items-start gap-2">
+                <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
+                <div>
+                  <div className="font-bold text-amber-300">Live Preflight Diagnostic Required</div>
+                  <div className="text-[11px] text-zinc-300 mt-0.5 leading-relaxed">
+                    Zero-risk 11-point diagnostic check must pass before submitting on-chain swaps. Run the preflight in Autotrade Studio to verify keypair, RPC node, and swap simulation.
+                  </div>
+                </div>
+              </div>
+              {onOpenWalletSettings && (
+                <button
+                  onClick={() => {
+                    onClose();
+                    onOpenWalletSettings();
+                  }}
+                  className="px-2.5 py-1.5 rounded bg-amber-400 hover:bg-amber-300 text-zinc-950 font-bold text-[11px] whitespace-nowrap shrink-0"
+                >
+                  Run Preflight &rarr;
+                </button>
+              )}
+            </div>
+          )}
 
           {/* Success Message Banner */}
           {executionResult && (
@@ -493,9 +574,9 @@ export const RealTradeOrderModal: React.FC<RealTradeOrderModalProps> = ({
 
             <button
               onClick={handleExecuteTrade}
-              disabled={isExecuting || (!isConnected && !localConfig?.walletAddress)}
+              disabled={isExecuting || (!isConnected && !localConfig?.walletAddress) || !localConfig?.lastPreflightPassed}
               className={`px-5 py-2 rounded-lg font-mono text-xs font-bold transition flex items-center gap-2 shadow-lg ${
-                isExecuting
+                isExecuting || !localConfig?.lastPreflightPassed
                   ? 'bg-zinc-800 text-zinc-500 cursor-not-allowed'
                   : !isConnected
                   ? 'bg-zinc-800 text-zinc-500 cursor-not-allowed'
@@ -506,6 +587,8 @@ export const RealTradeOrderModal: React.FC<RealTradeOrderModalProps> = ({
               <span>
                 {isExecuting
                   ? 'Submitting to Solana...'
+                  : !localConfig?.lastPreflightPassed
+                  ? 'Preflight Diagnostic Required'
                   : executionResult
                   ? 'Buy Again'
                   : `Execute Real Buy (${tradeSizeSol} SOL / ~$${tradeSizeUsd.toFixed(2)})`}

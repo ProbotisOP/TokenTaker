@@ -13,6 +13,7 @@ import { CounterfactualEngine } from './src/trading/counterfactualEngine.ts';
 import { ParameterTuner } from './src/trading/parameterTuner.ts';
 import { GrokBotEngine } from './src/trading/grokBotEngine.ts';
 import { WalletManager } from './src/trading/walletManager.ts';
+import { LivePreflightEngine } from './src/trading/livePreflightEngine.ts';
 import { SystemMode } from './src/types.ts';
 
 const app = express();
@@ -65,6 +66,7 @@ app.get('/api/health', (req, res) => {
 app.get('/api/state', (req, res) => {
   res.json({
     portfolio: coordinator.portfolio,
+    livePortfolio: walletManager.getLivePortfolioTelemetry(),
     config: coordinator.config,
     riskLimits: coordinator.riskLimits,
     weights: coordinator.weights,
@@ -86,10 +88,19 @@ app.post('/api/mode', (req, res) => {
   }
 
   // Safety confirmation for LIVE mode
-  if (mode === SystemMode.LIVE && !req.body.confirmedLiveDisclaimer) {
-    return res.status(403).json({
-      error: 'LIVE trading transition requires explicit operator disclaimer confirmation',
-    });
+  if (mode === SystemMode.LIVE) {
+    if (!req.body.confirmedLiveDisclaimer) {
+      return res.status(403).json({
+        error: 'LIVE trading transition requires explicit operator disclaimer confirmation',
+      });
+    }
+
+    const cfg = walletManager.getConfig();
+    if (!cfg.lastPreflightPassed || !walletManager.getDedicatedKeypair()) {
+      return res.status(403).json({
+        error: 'LIVE trading blocked: Live Preflight diagnostic must PASS with dedicated trading keypair loaded before enabling LIVE mode. Run diagnostic in Step 2.',
+      });
+    }
   }
 
   const result = coordinator.setMode(mode);
@@ -370,6 +381,15 @@ app.post('/api/wallet/disconnect', (req, res) => {
 app.post('/api/wallet/config', (req, res) => {
   try {
     const { updates } = req.body;
+    if (updates?.autotradeMode === 'FULL_AUTONOMOUS' || updates?.autotradeMode === 'SEMI_AUTONOMOUS') {
+      const currentCfg = walletManager.getConfig();
+      if (!currentCfg.lastPreflightPassed || !currentCfg.hasDedicatedKeypair) {
+        return res.status(403).json({
+          error: 'Cannot activate autonomous live trading: Live Preflight Diagnostic has not passed or dedicated keypair is missing. Please run preflight diagnostics first.',
+          requiresPreflight: true,
+        });
+      }
+    }
     const updated = walletManager.updateConfig(updates || {});
     res.json({ success: true, config: updated });
   } catch (err: any) {
@@ -403,14 +423,14 @@ app.post('/api/wallet/reset-kill-switch', (req, res) => {
  * - BREAKEVEN_SL: Instantly set stop-loss to entry price (risk-free trade)
  * - CUSTOM_SL_TP: Adjust custom SL % and TP % for this specific trade
  */
-app.post('/api/wallet/trade-exit', (req, res) => {
+app.post('/api/wallet/trade-exit', async (req, res) => {
   try {
     const { positionId, action, customStopLossPct, customTakeProfitPct } = req.body;
     if (!positionId || !action) {
       return res.status(400).json({ error: 'positionId and action are required' });
     }
 
-    const result = walletManager.executeTradeExit(positionId, action, {
+    const result = await walletManager.executeTradeExit(positionId, action, {
       customStopLossPct,
       customTakeProfitPct,
     });
@@ -421,6 +441,91 @@ app.post('/api/wallet/trade-exit', (req, res) => {
     res.json(result);
   } catch (err: any) {
     res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * LIVE Preflight Diagnostic Mode (11-point verification suite)
+ * Sends NO transactions, signs NO broadcasts, and spends ZERO funds.
+ */
+app.get('/api/wallet/preflight', async (req, res) => {
+  try {
+    const report = await LivePreflightEngine.runDiagnostic();
+    res.json({ success: true, report });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message || 'Preflight diagnostic failed' });
+  }
+});
+
+app.post('/api/wallet/preflight', async (req, res) => {
+  try {
+    const report = await LivePreflightEngine.runDiagnostic();
+    res.json({ success: true, report });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message || 'Preflight diagnostic failed' });
+  }
+});
+
+/**
+ * Dedicated Trading Keypair Status (Worker process only, never reveals private key)
+ */
+app.get('/api/wallet/keypair-status', (req, res) => {
+  try {
+    const config = walletManager.getConfig();
+    res.json({
+      success: true,
+      configuredAddress: config.walletAddress,
+      hasDedicatedKeypair: config.hasDedicatedKeypair,
+      keypairSource: config.keypairSource,
+      keypairPublicKey: config.keypairPublicKey,
+      lastPreflightPassed: config.lastPreflightPassed,
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * Setup Dedicated Trading Keypair (Server Worker Only)
+ * Allows generating a new dedicated keypair or importing a Phantom sub-account base58 key
+ */
+app.post('/api/wallet/setup-dedicated-keypair', async (req, res) => {
+  try {
+    const { privateKeyBase58 } = req.body || {};
+    const result = await walletManager.setupDedicatedKeypair(privateKeyBase58);
+    if (!result.success) {
+      return res.status(400).json(result);
+    }
+    res.json(result);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message || 'Keypair setup failed' });
+  }
+});
+
+/**
+ * Reset / Clear Dedicated Trading Keypair
+ */
+app.post('/api/wallet/reset-dedicated-keypair', (req, res) => {
+  try {
+    const result = walletManager.resetDedicatedKeypair();
+    res.json(result);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message || 'Keypair reset failed' });
+  }
+});
+
+/**
+ * Use Dedicated Keypair as Active Trading Wallet Address
+ */
+app.post('/api/wallet/use-dedicated-as-active', async (req, res) => {
+  try {
+    const result = await walletManager.useDedicatedKeypairAsActiveAddress();
+    if (!result.success) {
+      return res.status(400).json(result);
+    }
+    res.json(result);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message || 'Failed to switch active address' });
   }
 });
 
@@ -520,6 +625,69 @@ app.post('/api/wallet/execute-signal-trade', async (req, res) => {
 });
 
 /**
+ * 1-Click Enroll into a Real On-Chain Trade (Jupiter DEX / AMM)
+ */
+app.post('/api/wallet/one-click-enroll', async (req, res) => {
+  try {
+    const { tokenMint, symbol, name, sizeSol, slippageBps, priceSol, priceUsd } = req.body;
+    if (!tokenMint || !symbol || !sizeSol) {
+      return res.status(400).json({ error: 'tokenMint, symbol, and sizeSol are required' });
+    }
+    const result = await walletManager.oneClickEnroll({
+      tokenMint,
+      symbol,
+      name,
+      sizeSol: Number(sizeSol),
+      slippageBps: slippageBps ? Number(slippageBps) : undefined,
+      priceSol: priceSol ? Number(priceSol) : undefined,
+      priceUsd: priceUsd ? Number(priceUsd) : undefined,
+    });
+    if (!result.success) {
+      return res.status(400).json(result);
+    }
+    res.json(result);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message || 'One-click enroll failed' });
+  }
+});
+
+/**
+ * 1-Click Exit (Market Sell) from an On-Chain Trade
+ */
+app.post('/api/wallet/one-click-exit', async (req, res) => {
+  try {
+    const { positionId, pctToExit, slippageBps } = req.body;
+    if (!positionId) {
+      return res.status(400).json({ error: 'positionId is required' });
+    }
+    const result = await walletManager.oneClickExit({
+      positionId,
+      pctToExit: pctToExit ? (Number(pctToExit) as 100 | 50) : 100,
+      slippageBps: slippageBps ? Number(slippageBps) : undefined,
+    });
+    if (!result.success) {
+      return res.status(400).json(result);
+    }
+    res.json(result);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message || 'One-click exit failed' });
+  }
+});
+
+/**
+ * Reclaim All Token Holdings to SOL
+ * Liquidates all non-zero SPL Token and Token-2022 bags back to pure SOL
+ */
+app.post('/api/wallet/reclaim-all-tokens', async (_req, res) => {
+  try {
+    const result = await walletManager.reclaimAllTokenHoldingsToSol();
+    res.json(result);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message || 'Reclaim tokens failed' });
+  }
+});
+
+/**
  * Execute Preflight Test Swap (Safe test of routing, compute budget, slippage, and signature)
  */
 app.post('/api/wallet/test-swap', async (req, res) => {
@@ -542,10 +710,10 @@ app.post('/api/wallet/test-swap', async (req, res) => {
 /**
  * Legacy Position Action (Maps directly to unified trade exit)
  */
-app.post('/api/positions/action', (req, res) => {
+app.post('/api/positions/action', async (req, res) => {
   const { positionId, action } = req.body;
   const mappedAction = action === 'MANUAL_CLOSE' ? 'FLATTEN_100' : action;
-  const result = walletManager.executeTradeExit(positionId, mappedAction);
+  const result = await walletManager.executeTradeExit(positionId, mappedAction);
   if (!result.success) {
     return res.status(404).json(result);
   }

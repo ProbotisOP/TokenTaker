@@ -262,13 +262,20 @@ export interface Position {
   isRealWalletTrade?: boolean;
   walletAddress?: string;
   executionVenue?: string;
+  executionType?: 'PAPER_SIMULATED' | 'LIVE_ON_CHAIN';
+  isSimulated?: boolean;
+  simulationBadgeText?: string;
+  txSignature?: string;
+  solscanUrl?: string;
+  exitTxSignature?: string;
+  exitSolscanUrl?: string;
   executionHistory: {
-    action: 'ENTRY' | 'SCALE_OUT' | 'STOP' | 'EMERGENCY';
+    action: 'ENTRY' | 'SCALE_OUT' | 'STOP' | 'EMERGENCY' | 'BUY' | 'SELL';
     priceSol: number;
     tokens: number;
     pnlSol: number;
     timestamp: number;
-    txSignature: string;
+    txSignature?: string;
   }[];
 }
 
@@ -287,8 +294,10 @@ export interface TradeDecisionRecord {
   expectedSlippagePct: number;
   positionSizeSol: number;
   latencyBreakdown: LatencyBreakdown;
+  executionType?: 'PAPER_SIMULATED' | 'LIVE_ON_CHAIN';
+  isSimulated?: boolean;
   executionResult: {
-    txSignature: string;
+    txSignature?: string;
     expectedPriceSol: number;
     actualPriceSol: number;
     expectedSlippagePct: number;
@@ -814,6 +823,7 @@ export interface WalletAutotradeConfig {
   maxDailyDrawdownPct: number;
   maxDailyLossSol: number;
   maxSlippagePct: number;
+  maxPriceImpactPct?: number;
   
   // Kill Switch Settings & Rules
   killSwitchActive: boolean;
@@ -824,6 +834,62 @@ export interface WalletAutotradeConfig {
   // Enabled Signal Sources for Auto-Trading
   enabledSignalSources: string[];
   minSignalScore: number;
+
+  // Dedicated Trading Keypair (Server Worker Only - Private Key Never Exposing to Client)
+  hasDedicatedKeypair: boolean;
+  keypairSource: 'ENV' | 'SECURE_FILE' | 'MEMORY' | 'NONE';
+  keypairPublicKey: string | null;
+
+  // Preflight Diagnostic Status
+  lastPreflightPassed: boolean;
+  lastPreflightTimestamp?: number;
+}
+
+export type PreflightCheckId =
+  | 'trading_wallet_address'
+  | 'sol_balance'
+  | 'rpc_connectivity'
+  | 'keypair_loaded'
+  | 'jupiter_quote'
+  | 'swap_construction'
+  | 'transaction_simulation'
+  | 'risk_engine_approval'
+  | 'kill_switch'
+  | 'live_config_gates'
+  | 'worker_connectivity';
+
+export interface LivePreflightCheckItem {
+  id: PreflightCheckId;
+  name: string;
+  status: 'PASS' | 'FAIL' | 'WARN';
+  message: string;
+  details?: any;
+  durationMs?: number;
+}
+
+export interface LivePreflightReport {
+  timestamp: number;
+  configuredAddress: string | null;
+  network: SolanaNetwork;
+  rpcEndpoint: string;
+  passed: boolean;
+  allChecksPassed: boolean;
+  canExecuteLive: boolean;
+  summary: string;
+  hasKeypairLoaded: boolean;
+  onChainBalanceSol: number;
+  checks: LivePreflightCheckItem[];
+}
+
+export interface LivePortfolioTelemetry {
+  onChainSolBalance: number;
+  allocatedCapitalSol: number;
+  activeLiveExposureSol: number;
+  dailyRealizedPnlSol: number;
+  totalRealizedPnlSol: number;
+  unrealizedPnlSol: number;
+  openPositionsCount: number;
+  lastOnChainSync: number;
 }
 
 export interface WalletDiagnostics {
@@ -873,5 +939,55 @@ export interface SignalTradeResult {
   timestamp: number;
   mode: AutotradeMode;
   error?: string;
+  executionType?: 'PAPER_SIMULATED' | 'LIVE_ON_CHAIN';
+  isSimulated?: boolean;
+  simulationBadgeText?: string;
 }
+
+export interface OneClickEnrollRequest {
+  tokenMint: string;
+  symbol: string;
+  name?: string;
+  priceSol?: number;
+  priceUsd?: number;
+  sizeSol: number;
+  slippageBps?: number;
+}
+
+export interface OneClickEnrollResult {
+  success: boolean;
+  txSignature?: string;
+  explorerUrl?: string;
+  positionId?: string;
+  tokenMint: string;
+  symbol: string;
+  sizeSol: number;
+  tokensReceived?: number;
+  priceSol?: number;
+  error?: string;
+  timestamp: number;
+}
+
+export interface OneClickExitRequest {
+  positionId: string;
+  pctToExit?: 100 | 50;
+  slippageBps?: number;
+  reason?: string;
+}
+
+export interface OneClickExitResult {
+  success: boolean;
+  txSignature?: string;
+  explorerUrl?: string;
+  positionId: string;
+  symbol: string;
+  solReceived?: number;
+  tokensSold?: number;
+  remainingTokens?: number;
+  isFullyClosed: boolean;
+  error?: string;
+  message?: string;
+  timestamp: number;
+}
+
 

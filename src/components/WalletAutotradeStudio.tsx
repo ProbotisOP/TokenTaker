@@ -30,6 +30,10 @@ import {
   X,
   Radio,
   FileCheck,
+  Copy,
+  Key,
+  Eye,
+  EyeOff,
 } from 'lucide-react';
 import {
   WalletAutotradeConfig,
@@ -39,7 +43,10 @@ import {
   WalletDiagnostics,
   SignalTradeResult,
   SignalTradeTriggerRequest,
+  LivePreflightReport,
 } from '../types.ts';
+import { DedicatedKeypairModal } from './DedicatedKeypairModal.tsx';
+import { LivePreflightCenter } from './LivePreflightCenter.tsx';
 
 interface WalletAutotradeStudioProps {
   onNotify?: (msg: string) => void;
@@ -56,6 +63,8 @@ export const WalletAutotradeStudio: React.FC<WalletAutotradeStudioProps> = () =>
   const [customRpcInput, setCustomRpcInput] = useState<string>('');
   const [isConnectingBrowser, setIsConnectingBrowser] = useState<boolean>(false);
   const [showExtensionNotFoundModal, setShowExtensionNotFoundModal] = useState<boolean>(false);
+  const [showKeypairModal, setShowKeypairModal] = useState<boolean>(false);
+  const [keypairModalTab, setKeypairModalTab] = useState<'GENERATE' | 'IMPORT'>('GENERATE');
   const [notification, setNotification] = useState<{ text: string; type: 'success' | 'error' } | null>(null);
 
   // Diagnostics & testing states
@@ -319,7 +328,45 @@ export const WalletAutotradeStudio: React.FC<WalletAutotradeStudioProps> = () =>
     }
   };
 
+  const handleResetDedicatedKeypair = async () => {
+    if (!window.confirm('Reset local worker keypair? This deletes .secure_trading_keypair.json so you can import a new key.')) {
+      return;
+    }
+    try {
+      const res = await fetch('/api/wallet/reset-dedicated-keypair', { method: 'POST' });
+      const data = await res.json();
+      if (data.success) {
+        showToast('Worker keypair cleared.');
+        fetchWalletState();
+      }
+    } catch (err: any) {
+      showToast('Failed to reset keypair: ' + err.message, 'error');
+    }
+  };
+
+  const handleUseDedicatedAsActive = async () => {
+    try {
+      const res = await fetch('/api/wallet/use-dedicated-as-active', { method: 'POST' });
+      const data = await res.json();
+      if (data.success) {
+        const addr = data.config?.walletAddress;
+        if (addr) navigator.clipboard.writeText(addr);
+        showToast(`Active trading address set to ${addr?.slice(0, 6)}... (Address copied!)`);
+        fetchWalletState();
+      } else {
+        showToast(data.error || 'Failed to switch active address', 'error');
+      }
+    } catch (err: any) {
+      showToast('Error switching address: ' + err.message, 'error');
+    }
+  };
+
   const handleSaveConfig = async (updates: Partial<WalletAutotradeConfig>) => {
+    if ((updates.autotradeMode === 'FULL_AUTONOMOUS' || updates.autotradeMode === 'SEMI_AUTONOMOUS') && !config?.lastPreflightPassed) {
+      showToast('Live Preflight Diagnostic (11 checks) must pass before enabling autonomous modes. Please run Step 2.', 'error');
+      setActiveStep(2);
+      return;
+    }
     setIsSaving(true);
     try {
       const res = await fetch('/api/wallet/config', {
@@ -328,6 +375,9 @@ export const WalletAutotradeStudio: React.FC<WalletAutotradeStudioProps> = () =>
         body: JSON.stringify({ updates }),
       });
       const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data.error || 'Failed to save settings');
+      }
       if (data.config) {
         setConfig(data.config);
         showToast('Trading safeguards & parameters updated');
@@ -483,8 +533,8 @@ export const WalletAutotradeStudio: React.FC<WalletAutotradeStudioProps> = () =>
                     ON-CHAIN VERIFIED
                   </span>
                 ) : (
-                  <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-amber-500/10 text-amber-300 border border-amber-500/30 text-[11px] font-mono">
-                    STANDBY / PAPER
+                  <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-zinc-800 text-zinc-400 border border-zinc-700 text-[11px] font-mono">
+                    STANDBY / DISCONNECTED
                   </span>
                 )}
                 <span className="px-2 py-0.5 rounded bg-zinc-800 text-zinc-400 text-[11px] font-mono uppercase">
@@ -619,7 +669,7 @@ export const WalletAutotradeStudio: React.FC<WalletAutotradeStudioProps> = () =>
 
         <div className="flex items-center gap-2 shrink-0 self-end md:self-center">
           <button
-            onClick={() => setActiveStep(3)}
+            onClick={() => setActiveStep(4)}
             className="px-3.5 py-2 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white font-mono text-xs font-bold transition flex items-center gap-1.5 shadow-lg shadow-emerald-950/50"
           >
             <Sliders className="w-3.5 h-3.5" />
@@ -631,11 +681,12 @@ export const WalletAutotradeStudio: React.FC<WalletAutotradeStudioProps> = () =>
       {/* Step-by-Step Navigation Bar */}
       <div className="flex items-center gap-2 overflow-x-auto pb-1 border-b border-zinc-800">
         {[
-          { step: 1, title: '1. Connect Wallet', desc: 'Browser or Address' },
-          { step: 2, title: '2. Autotrade Mode', desc: 'Signals & Sizing' },
-          { step: 3, title: '3. How Many SOL to Use', desc: 'Capital Sizing & SL' },
-          { step: 4, title: '4. Kill Switch Rules', desc: 'When to Turn On' },
-          { step: 5, title: '5. Trade Exits', desc: `${activeTrades.length} Active Trades` },
+          { step: 1, title: '1. Dedicated Wallet', desc: 'Sub-Wallet & Keys' },
+          { step: 2, title: '2. Preflight Diagnostic', desc: '11 Zero-Risk Checks' },
+          { step: 3, title: '3. Autotrade Mode', desc: 'Signals & Sizing' },
+          { step: 4, title: '4. How Many SOL to Use', desc: 'Capital Sizing & SL' },
+          { step: 5, title: '5. Kill Switch Rules', desc: 'When to Turn On' },
+          { step: 6, title: '6. Trade Exits', desc: `${activeTrades.length} Active Trades` },
         ].map((tab) => (
           <button
             key={tab.step}
@@ -737,6 +788,167 @@ export const WalletAutotradeStudio: React.FC<WalletAutotradeStudioProps> = () =>
                 Connect your Solana wallet to allow the autonomous quant flipper to execute real-money trades, enforce on-chain stop losses, and scale out take profits directly into your custody.
               </p>
 
+              {/* Dedicated Solana Trading Sub-Wallet Card */}
+              <div className="p-4 rounded-xl bg-gradient-to-br from-zinc-950 via-zinc-900 to-zinc-950 border-2 border-amber-500/40 flex flex-col gap-3 shadow-xl">
+                <div className="flex items-start justify-between gap-3">
+                  <div className="flex items-center gap-2.5">
+                    <div className="p-2 rounded-lg bg-amber-400/10 border border-amber-400/30 text-amber-400">
+                      <Key className="w-5 h-5" />
+                    </div>
+                    <div>
+                      <div className="flex items-center gap-2 flex-wrap">
+                        <span className="text-xs font-mono font-bold uppercase tracking-wider text-zinc-100">
+                          Dedicated Trading Sub-Wallet (Worker Process)
+                        </span>
+                        {config?.hasDedicatedKeypair ? (
+                          <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-emerald-500/10 text-emerald-400 border border-emerald-500/30 text-[10px] font-mono font-bold">
+                            <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse"></span>
+                            KEYPAIR LOADED IN SECURE WORKER
+                          </span>
+                        ) : (
+                          <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-rose-500/10 text-rose-400 border border-rose-500/30 text-[10px] font-mono font-bold">
+                            <AlertTriangle className="w-3 h-3 text-rose-400" />
+                            NO TRADING KEYPAIR INITIALIZED
+                          </span>
+                        )}
+                      </div>
+                      <div className="text-[11px] font-mono text-zinc-400 mt-0.5">
+                        {config?.hasDedicatedKeypair
+                          ? `Keypair source: ${config.keypairSource || 'LOCAL_FILE'} (.secure_trading_keypair.json)`
+                          : 'A dedicated keypair is required to sign autonomous swaps without browser extension popups.'}
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="flex items-center gap-2 shrink-0 flex-wrap">
+                    <button
+                      onClick={() => {
+                        setKeypairModalTab('IMPORT');
+                        setShowKeypairModal(true);
+                      }}
+                      className="px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white font-mono font-bold text-xs uppercase tracking-wider transition shrink-0 shadow flex items-center gap-1.5"
+                    >
+                      <Key className="w-3.5 h-3.5" />
+                      <span>Import Sub-Account Key</span>
+                    </button>
+                    <button
+                      onClick={() => {
+                        setKeypairModalTab('GENERATE');
+                        setShowKeypairModal(true);
+                      }}
+                      className="px-3 py-1.5 rounded-lg bg-zinc-800 hover:bg-zinc-700 text-zinc-200 border border-zinc-700 font-mono font-bold text-xs uppercase tracking-wider transition shrink-0 shadow flex items-center gap-1.5"
+                    >
+                      <Sparkles className="w-3.5 h-3.5 text-amber-400" />
+                      <span>Generate New</span>
+                    </button>
+                  </div>
+                </div>
+
+                <div className="p-3 rounded-lg bg-zinc-950 border border-zinc-800 text-xs font-mono space-y-1.5">
+                  <div className="flex items-center justify-between text-zinc-400">
+                    <span className="text-[10px] uppercase font-bold text-zinc-500">Configured Trading Public Key:</span>
+                    <span className="text-[10px] text-zinc-500">
+                      Import this address into Phantom to view all real trades &amp; balance
+                    </span>
+                  </div>
+                  <div className="flex items-center justify-between gap-2 bg-zinc-900 px-2.5 py-1.5 rounded border border-zinc-800/80">
+                    <span className="text-zinc-200 font-bold truncate">
+                      {config?.keypairPublicKey || config?.walletAddress || 'None configured yet'}
+                    </span>
+                    <div className="flex items-center gap-2 shrink-0">
+                      <button
+                        onClick={() => {
+                          const addr = config?.keypairPublicKey || config?.walletAddress;
+                          if (addr) {
+                            navigator.clipboard.writeText(addr);
+                            showToast('Dedicated public address copied!');
+                          }
+                        }}
+                        className="text-zinc-400 hover:text-amber-300 flex items-center gap-1 text-[11px]"
+                        title="Copy address"
+                      >
+                        <Copy className="w-3.5 h-3.5" />
+                        <span>Copy</span>
+                      </button>
+                      {(config?.keypairPublicKey || config?.walletAddress) && (
+                        <a
+                          href={`https://solscan.io/account/${config?.keypairPublicKey || config?.walletAddress}${config?.network === 'devnet' ? '?cluster=devnet' : ''}`}
+                          target="_blank"
+                          rel="noreferrer"
+                          className="text-zinc-400 hover:text-cyan-400 flex items-center gap-1 text-[11px]"
+                        >
+                          <ExternalLink className="w-3.5 h-3.5" />
+                          <span>Solscan</span>
+                        </a>
+                      )}
+                    </div>
+                  </div>
+                </div>
+
+                <p className="text-[11px] font-mono text-zinc-400 leading-relaxed">
+                  <strong>Non-Custodial Architecture:</strong> The bot uses this dedicated sub-account for autonomous trading. Its private key exists <em>only</em> on your local machine in the secure worker process. <strong>Never</strong> paste your primary personal wallet&apos;s private key. Add this sub-account into Phantom to watch live transactions and fund it with your chosen trading capital (e.g. 0.05 &ndash; 0.1 SOL).
+                </p>
+              </div>
+
+              {/* Keypair vs Connected Address Mismatch Warning Banner */}
+              {config?.hasDedicatedKeypair && config?.walletAddress && config?.keypairPublicKey && config.walletAddress !== config.keypairPublicKey && (
+                <div className="p-4 rounded-xl bg-amber-950/40 border-2 border-amber-500/70 flex flex-col gap-3 shadow-xl font-mono">
+                  <div className="flex items-start gap-3 text-amber-200">
+                    <AlertTriangle className="w-5 h-5 text-amber-400 shrink-0 mt-0.5" />
+                    <div>
+                      <div className="text-xs font-bold uppercase tracking-wider text-amber-300">
+                        Keypair Mismatch Detected — Worker vs Connected Address
+                      </div>
+                      <p className="text-[11px] text-zinc-300 mt-1 leading-relaxed">
+                        Browser Phantom address: <strong className="text-amber-300">{config.walletAddress}</strong> ({config.balanceSol} SOL on-chain)
+                        <br />
+                        Worker signing keypair: <strong className="text-zinc-200">{config.keypairPublicKey}</strong> (held locally on server)
+                      </p>
+                      <p className="text-[11px] text-zinc-400 mt-1">
+                        Phantom extensions protect your security by never revealing private keys to websites. To trade autonomously without popups, choose one option below:
+                      </p>
+                    </div>
+                  </div>
+
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 pt-1">
+                    <button
+                      onClick={() => {
+                        setKeypairModalTab('IMPORT');
+                        setShowKeypairModal(true);
+                      }}
+                      className="p-3 rounded-xl bg-amber-400 hover:bg-amber-300 text-zinc-950 font-bold text-xs flex items-center justify-center gap-2 transition shadow-lg text-left"
+                    >
+                      <Key className="w-4 h-4 shrink-0" />
+                      <div>
+                        <div className="font-bold">Option 1: Import Connected Key</div>
+                        <div className="text-[10px] opacity-80 font-normal">Export {config.walletAddress.slice(0, 6)}... key from Phantom</div>
+                      </div>
+                    </button>
+
+                    <button
+                      onClick={handleUseDedicatedAsActive}
+                      className="p-3 rounded-xl bg-zinc-800 hover:bg-zinc-700 border border-zinc-700 text-zinc-200 font-bold text-xs flex items-center justify-center gap-2 transition shadow-lg text-left"
+                    >
+                      <Zap className="w-4 h-4 text-cyan-400 shrink-0" />
+                      <div>
+                        <div className="font-bold">Option 2: Use Worker Keypair</div>
+                        <div className="text-[10px] text-zinc-400 font-normal">Deposit 0.035+ SOL to {config.keypairPublicKey.slice(0, 6)}...</div>
+                      </div>
+                    </button>
+                  </div>
+
+                  <div className="flex items-center justify-between text-[10px] text-zinc-500 border-t border-amber-500/20 pt-2">
+                    <span>Clean start? Delete stale worker keypair file:</span>
+                    <button
+                      onClick={handleResetDedicatedKeypair}
+                      className="text-rose-400 hover:text-rose-300 underline font-semibold"
+                    >
+                      Reset Local Worker Keypair
+                    </button>
+                  </div>
+                </div>
+              )}
+
               {/* Demo Wallet Warning Notice */}
               {isConnected && (config?.walletName?.includes('Demo') || config?.walletAddress === '9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin') && (
                 <div className="p-3.5 rounded-xl bg-amber-950/40 border border-amber-500/40 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 text-xs font-mono">
@@ -833,10 +1045,10 @@ export const WalletAutotradeStudio: React.FC<WalletAutotradeStudioProps> = () =>
                   </button>
                   <span>&bull;</span>
                   <button
-                    onClick={() => handleConnectManualAddress('SoL9842PEPE2Zk99182390182490812490812PEPE2', 'Solana Whale Key')}
+                    onClick={() => handleConnectManualAddress('7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU', 'Solana Whale Account')}
                     className="text-cyan-400 hover:underline"
                   >
-                    SoL9...EPE2 (Devnet Test)
+                    7xKX...gAsU (Whale Watch)
                   </button>
                 </div>
               </div>
@@ -1015,7 +1227,7 @@ export const WalletAutotradeStudio: React.FC<WalletAutotradeStudioProps> = () =>
                 onClick={() => setActiveStep(2)}
                 className="w-full py-2.5 rounded-lg bg-amber-400 hover:bg-amber-300 text-zinc-950 font-mono font-bold text-xs uppercase tracking-wider transition flex items-center justify-center gap-1 mt-1"
               >
-                <span>Continue to Step 2: Autotrade Capabilities</span>
+                <span>Continue to Step 2: Live Preflight Diagnostic (11 Checks)</span>
                 <ChevronRight className="w-4 h-4" />
               </button>
             </div>
@@ -1023,20 +1235,66 @@ export const WalletAutotradeStudio: React.FC<WalletAutotradeStudioProps> = () =>
         </div>
       )}
 
-      {/* STEP 2: Autotrade Capabilities & Execution Mode */}
+      {/* STEP 2: Live Preflight Diagnostic (11 Checks) */}
       {activeStep === 2 && (
+        <div className="space-y-4">
+          <LivePreflightCenter onPreflightStatusChange={() => fetchWalletState()} />
+          <div className="flex flex-col sm:flex-row items-center justify-between gap-3 pt-2">
+            <button
+              onClick={() => setActiveStep(1)}
+              className="px-4 py-2.5 rounded-lg bg-zinc-800 hover:bg-zinc-700 text-zinc-300 font-mono text-xs font-semibold"
+            >
+              &larr; Back to Step 1: Dedicated Trading Wallet
+            </button>
+            <button
+              onClick={() => setActiveStep(3)}
+              className="px-5 py-2.5 rounded-lg bg-amber-400 hover:bg-amber-300 text-zinc-950 font-mono font-bold text-xs uppercase tracking-wider transition flex items-center gap-1 shadow-lg"
+            >
+              <span>Continue to Step 3: Autotrade Capabilities</span>
+              <ChevronRight className="w-4 h-4" />
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* STEP 3: Autotrade Capabilities & Execution Mode */}
+      {activeStep === 3 && (
         <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
           <div className="lg:col-span-8 flex flex-col gap-5">
             <div className="bg-zinc-900/60 border border-zinc-800 rounded-xl p-5 flex flex-col gap-4">
               <div className="flex items-center gap-2 text-emerald-400">
                 <Zap className="w-5 h-5" />
                 <h3 className="text-sm font-mono font-bold uppercase tracking-wider text-zinc-100">
-                  Step 2: Autotrade Execution Capabilities
+                  Step 3: Autotrade Execution Capabilities
                 </h3>
               </div>
               <p className="text-xs text-zinc-300 leading-relaxed font-mono">
                 Select how much autonomy the bot is granted when trading with your connected wallet. You can change this at any second.
               </p>
+
+              {/* Preflight Gate Warning Notice */}
+              {!config?.lastPreflightPassed && (
+                <div className="p-4 rounded-xl bg-amber-950/40 border border-amber-500/60 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 text-xs font-mono">
+                  <div className="flex items-start gap-2.5 text-amber-200">
+                    <AlertTriangle className="w-5 h-5 text-amber-400 shrink-0 mt-0.5" />
+                    <div>
+                      <span className="font-bold text-amber-300 uppercase tracking-wide">
+                        Live Autonomous Trading Gated — Preflight Required
+                      </span>
+                      <p className="text-[11px] text-zinc-300 mt-1 leading-relaxed">
+                        Before enabling <strong>Full Autonomous</strong> or <strong>Semi-Autonomous</strong> live execution, you must run the 11-point Live Preflight Diagnostic in Step 2 to verify RPC connectivity, keypair signatures, and zero-broadcast transaction simulations.
+                      </p>
+                    </div>
+                  </div>
+                  <button
+                    onClick={() => setActiveStep(2)}
+                    className="px-4 py-2 rounded-lg bg-amber-400 hover:bg-amber-300 text-zinc-950 font-bold text-xs uppercase tracking-wider shrink-0 transition flex items-center gap-1 shadow-md whitespace-nowrap"
+                  >
+                    <span>Run Preflight (Step 2)</span>
+                    <ChevronRight className="w-3.5 h-3.5" />
+                  </button>
+                </div>
+              )}
 
               {/* 3 Autotrade Modes */}
               <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
@@ -1316,10 +1574,10 @@ export const WalletAutotradeStudio: React.FC<WalletAutotradeStudioProps> = () =>
                         <ExternalLink className="w-3 h-3" />
                       </a>
                       <button
-                        onClick={() => setActiveStep(5)}
+                        onClick={() => setActiveStep(6)}
                         className="text-amber-400 hover:text-amber-300 font-bold"
                       >
-                        Manage in Trade Exits (Step 5) &rarr;
+                        Manage in Trade Exits (Step 6) &rarr;
                       </button>
                     </div>
                   </div>
@@ -1327,10 +1585,10 @@ export const WalletAutotradeStudio: React.FC<WalletAutotradeStudioProps> = () =>
               </div>
 
               <button
-                onClick={() => setActiveStep(3)}
+                onClick={() => setActiveStep(4)}
                 className="w-full py-2.5 rounded-lg bg-amber-400 hover:bg-amber-300 text-zinc-950 font-mono font-bold text-xs uppercase tracking-wider transition flex items-center justify-center gap-1 mt-2"
               >
-                <span>Continue to Step 3: Stop-Loss (SL) &amp; Sizing Limits</span>
+                <span>Continue to Step 4: How Many SOL to Use &amp; Sizing Limits</span>
                 <ChevronRight className="w-4 h-4" />
               </button>
             </div>
@@ -1368,8 +1626,8 @@ export const WalletAutotradeStudio: React.FC<WalletAutotradeStudioProps> = () =>
         </div>
       )}
 
-      {/* STEP 3: How Many SOL to Use (Capital Allocation) & Stop Loss */}
-      {activeStep === 3 && (
+      {/* STEP 4: How Many SOL to Use (Capital Allocation) & Stop Loss */}
+      {activeStep === 4 && (
         <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
           <div className="lg:col-span-7 flex flex-col gap-5">
             <div className="bg-zinc-900/60 border border-zinc-800 rounded-xl p-5 flex flex-col gap-5">
@@ -1377,7 +1635,7 @@ export const WalletAutotradeStudio: React.FC<WalletAutotradeStudioProps> = () =>
                 <div className="flex items-center gap-2 text-cyan-400">
                   <Sliders className="w-5 h-5" />
                   <h3 className="text-sm font-mono font-bold uppercase tracking-wider text-zinc-100">
-                    Step 3: How Many SOL to Use &amp; Trade Sizing Limits
+                    Step 4: How Many SOL to Use &amp; Trade Sizing Limits
                   </h3>
                 </div>
                 <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-emerald-950 text-emerald-400 border border-emerald-700/50">
@@ -1748,10 +2006,10 @@ export const WalletAutotradeStudio: React.FC<WalletAutotradeStudioProps> = () =>
               </div>
 
               <button
-                onClick={() => setActiveStep(4)}
+                onClick={() => setActiveStep(5)}
                 className="w-full py-2.5 rounded-lg bg-amber-400 hover:bg-amber-300 text-zinc-950 font-mono font-bold text-xs uppercase tracking-wider transition flex items-center justify-center gap-1 mt-2"
               >
-                <span>Continue to Step 4: When to Turn On Kill Switch</span>
+                <span>Continue to Step 5: When to Turn On Kill Switch</span>
                 <ChevronRight className="w-4 h-4" />
               </button>
             </div>
@@ -1830,8 +2088,8 @@ export const WalletAutotradeStudio: React.FC<WalletAutotradeStudioProps> = () =>
         </div>
       )}
 
-      {/* STEP 4: When to Turn On Kill Switch & Circuit Breakers */}
-      {activeStep === 4 && (
+      {/* STEP 5: When to Turn On Kill Switch & Circuit Breakers */}
+      {activeStep === 5 && (
         <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
           <div className="lg:col-span-8 flex flex-col gap-5">
             <div className="bg-zinc-900/60 border border-zinc-800 rounded-xl p-5 flex flex-col gap-5">
@@ -1839,7 +2097,7 @@ export const WalletAutotradeStudio: React.FC<WalletAutotradeStudioProps> = () =>
                 <div className="flex items-center gap-2 text-rose-400">
                   <ShieldAlert className="w-5 h-5" />
                   <h3 className="text-sm font-mono font-bold uppercase tracking-wider text-zinc-100">
-                    Step 4: When to Turn On Kill Switch (Rules &amp; Trigger Conditions)
+                    Step 5: When to Turn On Kill Switch (Rules &amp; Trigger Conditions)
                   </h3>
                 </div>
               </div>
@@ -1922,10 +2180,10 @@ export const WalletAutotradeStudio: React.FC<WalletAutotradeStudioProps> = () =>
               </div>
 
               <button
-                onClick={() => setActiveStep(5)}
+                onClick={() => setActiveStep(6)}
                 className="w-full py-2.5 rounded-lg bg-amber-400 hover:bg-amber-300 text-zinc-950 font-mono font-bold text-xs uppercase tracking-wider transition flex items-center justify-center gap-1 mt-2"
               >
-                <span>Continue to Step 5: Exit Options for Each Active Trade</span>
+                <span>Continue to Step 6: Exit Options for Each Active Trade</span>
                 <ChevronRight className="w-4 h-4" />
               </button>
             </div>
@@ -1965,8 +2223,8 @@ export const WalletAutotradeStudio: React.FC<WalletAutotradeStudioProps> = () =>
         </div>
       )}
 
-      {/* STEP 5: Exit For Each Trade Option */}
-      {activeStep === 5 && (
+      {/* STEP 6: Exit For Each Trade Option */}
+      {activeStep === 6 && (
         <div className="flex flex-col gap-5">
           <div className="bg-zinc-900/60 border border-zinc-800 rounded-xl p-5 flex flex-col gap-4">
             <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
@@ -1974,7 +2232,7 @@ export const WalletAutotradeStudio: React.FC<WalletAutotradeStudioProps> = () =>
                 <div className="flex items-center gap-2 text-emerald-400">
                   <TrendingUp className="w-5 h-5" />
                   <h3 className="text-sm font-mono font-bold uppercase tracking-wider text-zinc-100">
-                    Step 5: Granular Exit Options for Each Individual Trade ({activeTrades.length} Active)
+                    Step 6: Granular Exit Options for Each Individual Trade ({activeTrades.length} Active)
                   </h3>
                 </div>
                 <p className="text-xs text-zinc-400 font-mono mt-1">
@@ -2854,6 +3112,18 @@ export const WalletAutotradeStudio: React.FC<WalletAutotradeStudioProps> = () =>
           </div>
         </div>
       )}
+
+      {/* Dedicated Keypair Setup / Import Modal */}
+      <DedicatedKeypairModal
+        isOpen={showKeypairModal}
+        onClose={() => setShowKeypairModal(false)}
+        onSuccess={() => fetchWalletState()}
+        onKeypairConfigured={() => fetchWalletState()}
+        currentAddress={config?.walletAddress}
+        currentPublicKey={config?.keypairPublicKey}
+        hasKeypair={config?.hasDedicatedKeypair}
+        initialTab={keypairModalTab}
+      />
     </div>
   );
 };

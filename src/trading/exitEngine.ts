@@ -18,8 +18,8 @@ export class ExitEngine {
    * Evaluates position against live microstructure and exits rules
    */
   public static evaluatePosition(position: Position, micro: LiveMarketMicrostructure): ExitSignal {
-    const currentPrice = micro.priceSol;
-    const pnlPct = ((currentPrice - position.entryPriceSol) / position.entryPriceSol) * 100;
+    const currentPrice = position.currentPriceSol > 0 ? position.currentPriceSol : micro.priceSol;
+    const pnlPct = position.entryPriceSol > 0 ? ((currentPrice - position.entryPriceSol) / position.entryPriceSol) * 100 : 0;
     const holdingSec = (Date.now() - position.enteredAt) / 1000;
 
     // 1. Hard Liquidity Emergency (Rug / LP Drain Attempt)
@@ -55,9 +55,9 @@ export class ExitEngine {
       };
     }
 
-    // 4. Flow Reversal Detection (Momentum breakdown)
-    // If we've held > 15 seconds, and buy/sell ratio collapses below 0.35 with negative velocity
-    if (holdingSec > 15 && micro.buySellRatio < 0.35 && micro.priceVelocity < -2.0) {
+    // 4. Flow Reversal Detection (Momentum breakdown - SIMULATED / PAPER ONLY)
+    // Never auto-dump a user's real on-chain trade based on mock flow ticks!
+    if (!position.isRealWalletTrade && holdingSec > 15 && micro.buySellRatio < 0.35 && micro.priceVelocity < -2.0) {
       return {
         shouldExit: true,
         action: 'FULL_EXIT',
@@ -83,9 +83,9 @@ export class ExitEngine {
       }
     }
 
-    // 6. Time-based Expiration (Dead Launch Timeout)
-    // If in trade > 180 seconds and return is near breakeven or negative with negligible volume
-    if (holdingSec > 180 && pnlPct < 5.0 && micro.windows['30s'].volumeSol < 0.5) {
+    // 6. Time-based Expiration (Dead Launch Timeout - SIMULATED / PAPER ONLY)
+    // Real trades are managed by user 1-click exit, SL floor, and TP ladder!
+    if (!position.isRealWalletTrade && holdingSec > 180 && pnlPct < 5.0 && micro.windows['30s'].volumeSol < 0.5) {
       return {
         shouldExit: true,
         action: 'FULL_EXIT',

@@ -40,7 +40,7 @@ export const DEFAULT_STRATEGY_WEIGHTS: StrategyWeights = {
 };
 
 export const DEFAULT_SYSTEM_CONFIG: SystemConfig = {
-  mode: SystemMode.PAPER,
+  mode: SystemMode.LIVE,
   rpcEndpoint: 'https://api.mainnet-beta.solana.com',
   rpcBackupEndpoint: 'https://solana-mainnet.g.alchemy.com/v2/demo',
   wsEndpoint: 'wss://api.mainnet-beta.solana.com',
@@ -52,5 +52,5 @@ export const DEFAULT_SYSTEM_CONFIG: SystemConfig = {
   minOpportunityScore: 65, // 65+ opportunity score required (empirically calibrated positive edge)
   minLiquiditySol: 8.0,
   maxInitialLiquiditySol: 250.0,
-  simulationModeOnly: true,
+  simulationModeOnly: false,
 };
