@@ -239,8 +239,12 @@ export interface Position {
   currentPriceSol: number;
   currentPriceUsd: number;
   peakPriceUsd: number;
+  peakPriceSol?: number;
+  lastPriceAt?: number;
   lowestPriceUsd: number;
   sizeTokens: number;
+  sizeBaseUnits?: string;
+  tokenDecimals?: number;
   costBasisSol: number;
   currentValueSol: number;
   unrealizedPnlSol: number;
@@ -452,6 +456,14 @@ export interface CandidateTokenState {
   decision: DecisionAction;
   decisionReasons: string[];
   recentWallets: { address: string; category: WalletCategory; reputation: number }[];
+  entryStage?: 'OBSERVING' | 'ACCUMULATING' | 'CONFIRMED' | 'REJECTED' | 'EXPIRED';
+  dataSource?: 'PUMPPORTAL';
+  inspectedAt?: number;
+  inspectionError?: string;
+  curveVerified?: boolean;
+  entryMetrics?: { runupPct: number; uniqueBuyers: number; netFlowSol: number; buyShare: number; largestBuyerShare: number };
+  executionStatus?: 'NOT_SUBMITTED' | 'CHECKING_ROUTE' | 'CONFIRMED' | 'BLOCKED';
+  executionError?: string;
   // Strictly separated 4-dimension audit metrics
   exitabilityScore?: number; // 0-100
   empiricalWinProb?: number; // 0-1
@@ -970,7 +982,7 @@ export interface OneClickEnrollResult {
 
 export interface OneClickExitRequest {
   positionId: string;
-  pctToExit?: 100 | 50;
+  pctToExit?: number;
   slippageBps?: number;
   reason?: string;
 }

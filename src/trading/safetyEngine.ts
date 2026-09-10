@@ -22,7 +22,10 @@ export interface SafetyAnalysisInput {
   washTradingDetected: boolean;
   creatorDumpRisk: boolean;
   liquiditySol: number;
+  minLiquiditySol?: number;
   marketCapUsd: number;
+  marketCapSol?: number;
+  verifiedActiveCurve?: boolean;
   poolAgeSec: number;
 }
 
@@ -30,6 +33,32 @@ export class SafetyEngine {
   public static evaluate(input: SafetyAnalysisInput): TokenSafetyReport {
     const rejectReasons: string[] = [];
     let score = 100;
+    const percentages = ['lpBurnPct', 'top1Percent', 'top5Percent', 'top10Percent', 'creatorOwnershipPercent'] as const;
+    const nonnegative = ['liquiditySol', 'marketCapUsd', 'poolAgeSec', 'bundledWalletsDetected'] as const;
+    const flags = ['mintAuthorityRevoked', 'freezeAuthorityRevoked', 'hasSuspiciousExtensions', 'supplyAnomalies', 'insiderClusterDetected', 'washTradingDetected', 'creatorDumpRisk'] as const;
+    const invalid = percentages.some(key => !Number.isFinite(input[key]) || input[key] < 0 || input[key] > 100)
+      || nonnegative.some(key => !Number.isFinite(input[key]) || input[key] < 0)
+      || (input.marketCapSol !== undefined ? !Number.isFinite(input.marketCapSol) || input.marketCapSol <= 0 : input.marketCapUsd <= 0)
+      || !Number.isInteger(input.bundledWalletsDetected)
+      || flags.some(key => typeof input[key] !== 'boolean')
+      || !Array.isArray(input.suspiciousExtensions)
+      || input.suspiciousExtensions.some(value => typeof value !== 'string')
+      || input.top1Percent > input.top5Percent || input.top5Percent > input.top10Percent;
+    if (invalid) {
+      rejectReasons.push('CRITICAL: Invalid or missing safety evidence');
+      score = 0;
+    }
+    input = { ...input, suspiciousExtensions: Array.isArray(input.suspiciousExtensions) ? input.suspiciousExtensions : [] };
+    for (const key of [...percentages, ...nonnegative]) {
+      if (!Number.isFinite(input[key])) input[key] = 0;
+    }
+    // Token-2022 requires extension-specific verification, not just a caller's program label.
+    const tokenProgramSafe = input.tokenProgram === 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA'
+      && input.hasSuspiciousExtensions === false && input.suspiciousExtensions.length === 0 && !invalid;
+    if (!tokenProgramSafe) {
+      score = 0;
+      rejectReasons.push('CRITICAL: Unsupported or unverified token program');
+    }
 
     // 1. Critical Token Permissions: Mint & Freeze Authorities
     if (!input.mintAuthorityRevoked) {
@@ -54,19 +83,21 @@ export class SafetyEngine {
     }
 
     // 3. Liquidity Safety & LP Lock / Burn
-    if (input.liquiditySol < 6.0) {
+    const minLiquidity = input.minLiquiditySol ?? 6;
+    if (!Number.isFinite(minLiquidity) || minLiquidity <= 0 || input.liquiditySol < minLiquidity) {
       score -= 25;
-      rejectReasons.push(`LOW LIQUIDITY: Pool liquidity (${input.liquiditySol.toFixed(1)} SOL) below minimum viability threshold (6.0 SOL)`);
+      rejectReasons.push(`LOW LIQUIDITY: Pool liquidity (${input.liquiditySol.toFixed(1)} SOL) below minimum (${minLiquidity} SOL)`);
     }
 
-    if (input.lpBurnPct < 85 && input.metadata.launchVenue !== 'Pump.fun') {
-      // Pump.fun uses a virtual bonding curve until migration; standard AMM requires LP burn
+    if (input.lpBurnPct < 85 && !(input.verifiedActiveCurve === true && input.metadata.launchVenue === 'Pump.fun')) {
       score -= 25;
       rejectReasons.push(`LP RISK: Liquidity pool burn/lock is only ${input.lpBurnPct.toFixed(0)}% (requires >= 85%)`);
     }
 
     // Liquidity relative to market cap check
-    const liquidityRatio = input.marketCapUsd > 0 ? (input.liquiditySol * 160) / input.marketCapUsd : 0;
+    const liquidityRatio = input.marketCapSol !== undefined
+      ? input.liquiditySol / input.marketCapSol
+      : input.marketCapUsd > 0 ? (input.liquiditySol * 160) / input.marketCapUsd : 0;
     if (liquidityRatio < 0.08 && input.poolAgeSec > 20) {
       score -= 15;
       rejectReasons.push(`LIQUIDITY RATIO: Liquidity to market cap ratio (${(liquidityRatio * 100).toFixed(1)}%) indicates paper-thin depth`);
@@ -136,7 +167,7 @@ export class SafetyEngine {
       freezeAuthorityRevoked: input.freezeAuthorityRevoked,
       lpBurnOrLocked: input.lpBurnPct >= 85,
       lpBurnPct: input.lpBurnPct,
-      tokenProgramSafe: !input.hasSuspiciousExtensions,
+      tokenProgramSafe,
       suspiciousExtensions: input.suspiciousExtensions,
       supplyAnomalies: input.supplyAnomalies,
       top1Percent: input.top1Percent,
@@ -152,7 +183,7 @@ export class SafetyEngine {
         freezeAuthorityRevoked: input.freezeAuthorityRevoked,
         lpBurnedOrLocked: input.lpBurnPct >= 85,
         supplyMatch: !input.supplyAnomalies,
-        tokenProgramLegitimate: !input.hasSuspiciousExtensions,
+        tokenProgramLegitimate: tokenProgramSafe,
         topHoldersSafe: input.top1Percent <= 15 && input.top10Percent <= 50,
         noSuspiciousExtensions: input.suspiciousExtensions.length === 0,
       },

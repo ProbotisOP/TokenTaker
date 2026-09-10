@@ -1,24 +1,9 @@
-/**
- * Jupiter v6 DEX Swap Service
- * Handles quote resolution, swap transaction construction, simulation, and live execution.
- */
-import {
-  Connection,
-  Keypair,
-  PublicKey,
-  VersionedTransaction,
-  TransactionMessage,
-  SystemProgram,
-  LAMPORTS_PER_SOL,
-} from '@solana/web3.js';
-import {
-  solToLamports,
-  lamportsToSol,
-  toTokenBaseUnits,
-  toTokenHumanAmount,
-  getOnChainTokenDecimals,
-  getOnChainTokenBalance,
-} from './decimalSafeUtils.ts';
+import { Connection, Keypair, PublicKey, VersionedTransaction } from '@solana/web3.js';
+import bs58 from 'bs58';
+import fs from 'node:fs';
+import path from 'node:path';
+import { lamportsToSol, toTokenHumanAmount, getOnChainTokenBalance } from './decimalSafeUtils.ts';
+import { attestSwap } from './swapAttestation.ts';
 import { TradeSafetyValidator } from './tradeSafetyValidator.ts';
 
 export const SOL_MINT = 'So11111111111111111111111111111111111111112';
@@ -31,7 +16,6 @@ export interface JupiterQuoteParams {
   amountLamports: number | bigint | string;
   slippageBps?: number;
 }
-
 export interface JupiterQuoteResult {
   success: boolean;
   data?: any;
@@ -41,7 +25,6 @@ export interface JupiterQuoteResult {
   routePlanSummary?: string;
   error?: string;
 }
-
 export interface JupiterSwapBuildResult {
   success: boolean;
   swapTransactionBase64?: string;
@@ -49,7 +32,6 @@ export interface JupiterSwapBuildResult {
   lastValidBlockHeight?: number;
   error?: string;
 }
-
 export interface JupiterSimulationResult {
   success: boolean;
   unitsConsumed?: number;
@@ -57,11 +39,18 @@ export interface JupiterSimulationResult {
   err?: any;
   error?: string;
 }
-
+export interface ConfirmedFill {
+  tokenBaseUnits: string;
+  tokenDecimals: number;
+  solLamports: string;
+  feeLamports: number;
+}
 export interface JupiterLiveExecutionResult {
   success: boolean;
+  status?: 'REJECTED' | 'FAILED' | 'UNKNOWN' | 'CONFIRMED';
   txSignature?: string;
   explorerUrl?: string;
+  fill?: ConfirmedFill;
   inAmountSol?: number;
   outAmountSol?: number;
   solReceived?: number;
@@ -69,408 +58,237 @@ export interface JupiterLiveExecutionResult {
   tokensSold?: number;
   error?: string;
 }
+export interface ExecutionContext {
+  action: 'BUY' | 'SELL';
+  tokenMint: string;
+  walletAddress: string;
+  tokenDecimals: number;
+  inputBaseUnits: string;
+  minimumOutputBaseUnits: string;
+  quoteFetchedAt: number;
+  // Called immediately before signing, after every asynchronous guard has finished.
+  finalGuard: () => void;
+}
+export interface PendingExecution {
+  signature: string;
+  walletAddress: string;
+  tokenMint: string;
+  action: 'BUY' | 'SELL';
+  blockhash: string;
+  lastValidBlockHeight: number;
+  status: 'UNKNOWN' | 'CONFIRMED';
+  submittedAt: number;
+  error?: string;
+}
 
 export class JupiterService {
+  public static attestTransaction = attestSwap;
   private static JUPITER_QUOTE_API = 'https://api.jup.ag/swap/v1/quote';
   private static JUPITER_SWAP_API = 'https://api.jup.ag/swap/v1/swap';
+  private static pending: Map<string, PendingExecution> | null = null;
+  private static journalPath = path.join(process.cwd(), '.execution-pending.json');
 
-  /**
-   * Fetches best route quote from Jupiter v6 API
-   */
+  private static loadPending(): Map<string, PendingExecution> {
+    if (!this.pending) {
+      const rows = fs.existsSync(this.journalPath) ? JSON.parse(fs.readFileSync(this.journalPath, 'utf8')) : [];
+      if (!Array.isArray(rows) || rows.some(r => !r.signature || !r.tokenMint || !r.walletAddress)) {
+        throw new Error('Pending execution journal is invalid; live execution blocked');
+      }
+      this.pending = new Map(rows.map(r => [r.signature, r]));
+    }
+    return this.pending;
+  }
+  private static persistPending(): void {
+    const tmp = `${this.journalPath}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify([...this.loadPending().values()]), { mode: 0o600 });
+    const fd = fs.openSync(tmp, 'r');
+    try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+    fs.renameSync(tmp, this.journalPath);
+    const dir = fs.openSync(path.dirname(this.journalPath), 'r');
+    try { fs.fsyncSync(dir); } finally { fs.closeSync(dir); }
+  }
+  public static getPendingExecutions(): PendingExecution[] {
+    return [...this.loadPending().values()].map(p => ({ ...p }));
+  }
+  public static hasPendingExecution(wallet: string, mint?: string): boolean {
+    return this.getPendingExecutions().some(p => p.walletAddress === wallet && (!mint || p.tokenMint === mint));
+  }
+  public static acknowledgeSettlement(signature: string): void {
+    const pending = this.loadPending().get(signature);
+    if (!pending) return;
+    if (pending.status !== 'CONFIRMED') throw new Error('Unconfirmed execution cannot be cleared');
+    this.loadPending().delete(signature);
+    this.persistPending();
+  }
+  // UNKNOWN signatures remain blocked until transaction-specific accounting is reconciled.
+
   public static async fetchQuote(params: JupiterQuoteParams): Promise<JupiterQuoteResult> {
     try {
       const { inputMint, outputMint, amountLamports, slippageBps = 150 } = params;
+      if (!/^[1-9][0-9]*$/.test(String(amountLamports)) ||
+          (typeof amountLamports === 'number' && !Number.isSafeInteger(amountLamports)) ||
+          !Number.isInteger(slippageBps) || slippageBps < 0 || slippageBps > 5000) {
+        throw new Error('Invalid exact input amount or slippage');
+      }
       const url = new URL(this.JUPITER_QUOTE_API);
       url.searchParams.set('inputMint', inputMint);
       url.searchParams.set('outputMint', outputMint);
-      url.searchParams.set('amount', amountLamports.toString());
-      url.searchParams.set('slippageBps', slippageBps.toString());
+      url.searchParams.set('amount', String(amountLamports));
+      url.searchParams.set('slippageBps', String(slippageBps));
       url.searchParams.set('restrictIntermediateTokens', 'true');
-
-      const response = await fetch(url.toString(), {
-        headers: {
-          'Accept': 'application/json',
-          'User-Agent': 'TokenTaker-QuantEngine/1.0',
-        },
-      });
-
-      if (!response.ok) {
-        const errText = await response.text();
-        return {
-          success: false,
-          error: `Jupiter quote API returned status ${response.status}: ${errText.slice(0, 150)}`,
-        };
-      }
-
+      url.searchParams.set('onlyDirectRoutes', 'true');
+      const response = await fetch(url, { headers: { Accept: 'application/json',
+        ...(process.env.JUPITER_API_KEY ? { 'x-api-key': process.env.JUPITER_API_KEY } : {}) }, signal: AbortSignal.timeout(5000) });
+      if (!response.ok) throw new Error(`Jupiter quote HTTP ${response.status}`);
       const data = await response.json();
-      if (!data || !data.outAmount) {
-        return {
-          success: false,
-          error: 'Jupiter returned empty route for token pair',
-        };
-      }
-
-      const routes = (data.routePlan || [])
-        .map((r: any) => r.swapInfo?.label || 'DEX')
-        .join(' -> ');
-
-      return {
-        success: true,
-        data,
-        inAmount: data.inAmount,
-        outAmount: data.outAmount,
-        priceImpactPct: Number(data.priceImpactPct || 0),
-        routePlanSummary: routes || 'Direct AMM Pool',
-      };
-    } catch (err: any) {
-      return {
-        success: false,
-        error: `Failed to query Jupiter quote: ${err.message || err}`,
-      };
-    }
+      if (!data?.outAmount || !Array.isArray(data.routePlan)) throw new Error('Malformed quote');
+      Object.defineProperty(data, 'fetchedAt', { value: Date.now(), enumerable: false });
+      return { success: true, data, inAmount: data.inAmount, outAmount: data.outAmount,
+        priceImpactPct: Number(data.priceImpactPct),
+        routePlanSummary: data.routePlan.map((r: any) => r.swapInfo?.label || 'DEX').join(' -> ') };
+    } catch (err: any) { return { success: false, error: err.message }; }
   }
 
-  /**
-   * Requests serialized VersionedTransaction from Jupiter v6
-   */
-  public static async buildSwapTransaction(
-    quoteResponse: any,
-    userPublicKey: string,
-    priorityFeeLamports: number = 100_000
-  ): Promise<JupiterSwapBuildResult> {
+  public static async buildSwapTransaction(quoteResponse: any, userPublicKey: string, priorityFeeLamports = 100_000): Promise<JupiterSwapBuildResult> {
     try {
-      const body = {
-        quoteResponse,
-        userPublicKey,
-        wrapAndUnwrapSol: true,
-        dynamicComputeUnitLimit: true,
-        prioritizationFeeLamports: priorityFeeLamports,
-      };
-
       const response = await fetch(this.JUPITER_SWAP_API, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Accept': 'application/json',
-          'User-Agent': 'TokenTaker-QuantEngine/1.0',
-        },
-        body: JSON.stringify(body),
+        method: 'POST', headers: { 'Content-Type': 'application/json', Accept: 'application/json',
+          ...(process.env.JUPITER_API_KEY ? { 'x-api-key': process.env.JUPITER_API_KEY } : {}) },
+        signal: AbortSignal.timeout(5000),
+        body: JSON.stringify({ quoteResponse, userPublicKey, wrapAndUnwrapSol: true, useSharedAccounts: false,
+          dynamicComputeUnitLimit: true, prioritizationFeeLamports: priorityFeeLamports }),
       });
-
-      if (!response.ok) {
-        const errText = await response.text();
-        return {
-          success: false,
-          error: `Jupiter swap build returned status ${response.status}: ${errText.slice(0, 150)}`,
-        };
-      }
-
+      if (!response.ok) throw new Error(`Jupiter swap HTTP ${response.status}`);
       const data = await response.json();
-      if (!data.swapTransaction) {
-        return {
-          success: false,
-          error: 'Jupiter returned no swapTransaction base64 payload',
-        };
+      if (!data.swapTransaction || !Number.isSafeInteger(data.lastValidBlockHeight) || data.lastValidBlockHeight <= 0) {
+        throw new Error('Swap payload missing transaction or original validity window');
       }
-
-      const swapTransactionBuf = Buffer.from(data.swapTransaction, 'base64');
-      const versionedTx = VersionedTransaction.deserialize(swapTransactionBuf);
-
-      return {
-        success: true,
-        swapTransactionBase64: data.swapTransaction,
-        versionedTx,
-        lastValidBlockHeight: data.lastValidBlockHeight,
-      };
-    } catch (err: any) {
-      return {
-        success: false,
-        error: `Failed to build Jupiter swap transaction: ${err.message || err}`,
-      };
-    }
+      return { success: true, swapTransactionBase64: data.swapTransaction,
+        versionedTx: VersionedTransaction.deserialize(Buffer.from(data.swapTransaction, 'base64')),
+        lastValidBlockHeight: data.lastValidBlockHeight };
+    } catch (err: any) { return { success: false, error: err.message }; }
   }
 
-  /**
-   * Simulates transaction execution on Solana (ZERO BROADCAST, ZERO FUNDS SPENT)
-   */
-  public static async simulateSwap(
-    connection: Connection,
-    versionedTx: VersionedTransaction
-  ): Promise<JupiterSimulationResult> {
+  public static async simulateSwap(connection: Connection, versionedTx: VersionedTransaction): Promise<JupiterSimulationResult> {
     try {
-      const sim = await connection.simulateTransaction(versionedTx, {
-        sigVerify: false,
-        replaceRecentBlockhash: true,
-      });
-
-      if (sim.value.err) {
-        return {
-          success: false,
-          err: sim.value.err,
-          logs: sim.value.logs || [],
-          unitsConsumed: sim.value.unitsConsumed || 0,
-          error: `Simulation returned on-chain error: ${JSON.stringify(sim.value.err)}`,
-        };
-      }
-
-      return {
-        success: true,
-        unitsConsumed: sim.value.unitsConsumed || 0,
-        logs: sim.value.logs || [],
-      };
-    } catch (err: any) {
-      return {
-        success: false,
-        error: `RPC transaction simulation failed: ${err.message || err}`,
-      };
-    }
+      const sim = await connection.simulateTransaction(versionedTx, { sigVerify: false, replaceRecentBlockhash: true });
+      return { success: !sim.value.err, err: sim.value.err, logs: sim.value.logs || [],
+        unitsConsumed: sim.value.unitsConsumed, error: sim.value.err ? JSON.stringify(sim.value.err) : undefined };
+    } catch (err: any) { return { success: false, error: err.message }; }
   }
 
-  /**
-   * Signs with dedicated keypair and broadcasts live transaction to Solana
-   */
-  public static async signAndExecuteSwap(
-    connection: Connection,
-    versionedTx: VersionedTransaction,
-    keypair: Keypair
-  ): Promise<JupiterLiveExecutionResult> {
+  public static readConfirmedFill(transaction: any, context: ExecutionContext): ConfirmedFill {
+    const meta = transaction?.meta;
+    if (!meta || meta.err || !Array.isArray(meta.preTokenBalances) || !Array.isArray(meta.postTokenBalances)) {
+      throw new Error('Confirmed transaction fill metadata unavailable');
+    }
+    const staticKeys = transaction.transaction.message.staticAccountKeys ?? transaction.transaction.message.accountKeys;
+    const keys = [...staticKeys, ...(meta.loadedAddresses?.writable ?? []), ...(meta.loadedAddresses?.readonly ?? [])];
+    const index = keys.findIndex((k: any) => (k.pubkey ?? k).toString() === context.walletAddress);
+    if (index !== 0 || !Number.isSafeInteger(meta.preBalances[index]) || !Number.isSafeInteger(meta.postBalances[index]) ||
+        !Number.isSafeInteger(meta.fee) || meta.fee < 0) throw new Error('Unverifiable native balance delta');
+    const sum = (rows: any[]): bigint => rows.reduce<bigint>((n: bigint, row: any) => {
+      if (row.mint !== context.tokenMint || row.owner !== context.walletAddress) return n;
+      if (row.uiTokenAmount.decimals !== context.tokenDecimals || !/^[0-9]+$/.test(row.uiTokenAmount.amount)) {
+        throw new Error('Unverifiable token balance delta');
+      }
+      return n + BigInt(row.uiTokenAmount.amount);
+    }, 0n);
+    const tokenDelta = sum(meta.postTokenBalances) - sum(meta.preTokenBalances);
+    const nativeDelta = BigInt(meta.postBalances[index]) - BigInt(meta.preBalances[index]);
+    const tokens = context.action === 'BUY' ? tokenDelta : -tokenDelta;
+    // Native cash delta includes network fees and account rent, never quoted proceeds.
+    const sol = context.action === 'BUY' ? -nativeDelta : nativeDelta;
+    if (tokens <= 0n || sol <= 0n) throw new Error('Non-positive actual fill');
+    if (context.action === 'SELL' && tokens !== BigInt(context.inputBaseUnits)) throw new Error('Sell fill differs from exact position quantity');
+    if (context.action === 'BUY' && tokens < BigInt(context.minimumOutputBaseUnits)) throw new Error('Buy fill below minimum output');
+    return { tokenBaseUnits: tokens.toString(), tokenDecimals: context.tokenDecimals, solLamports: sol.toString(), feeLamports: meta.fee };
+  }
+
+  public static async signAndExecuteSwap(connection: Connection, versionedTx: VersionedTransaction, keypair: Keypair,
+    lastValidBlockHeight?: number, context?: ExecutionContext): Promise<JupiterLiveExecutionResult> {
+    let signature: string | undefined;
+    let pending: PendingExecution | undefined;
     try {
-      // 1. Sign on server worker with dedicated trading keypair
+      if (process.env.ENABLE_LIVE_TRADING !== 'true') throw new Error('ENABLE_LIVE_TRADING must explicitly equal true');
+      if (!context || !Number.isSafeInteger(lastValidBlockHeight) || lastValidBlockHeight! <= 0) throw new Error('Missing guarded execution context or original block height');
+      if (context.walletAddress !== keypair.publicKey.toBase58()) throw new Error('Foreign signing wallet');
+      if (this.hasPendingExecution(context.walletAddress, context.action === 'BUY' ? undefined : context.tokenMint)) throw new Error('Pending execution requires reconciliation');
+      await this.attestTransaction(connection, versionedTx, context);
+      if (!Number.isFinite(context.quoteFetchedAt) || Date.now() - context.quoteFetchedAt > TradeSafetyValidator.MAX_QUOTE_AGE_MS || context.quoteFetchedAt > Date.now()) throw new Error('Stale quote at signer');
+      TradeSafetyValidator.validateCompiledTransaction({ versioned_tx: versionedTx, wallet_pubkey: context.walletAddress,
+        intended_action: context.action, intended_token_mint: context.tokenMint });
+      context.finalGuard();
+      TradeSafetyValidator.validateCompiledTransaction({ versioned_tx: versionedTx, wallet_pubkey: context.walletAddress,
+        intended_action: context.action, intended_token_mint: context.tokenMint });
       versionedTx.sign([keypair]);
-
-      // 2. Broadcast raw transaction
-      const rawTransaction = versionedTx.serialize();
-      const txid = await connection.sendRawTransaction(rawTransaction, {
-        skipPreflight: false,
-        maxRetries: 3,
-        preflightCommitment: 'confirmed',
-      });
-
-      // 3. Confirm transaction
-      const latestBlockhash = await connection.getLatestBlockhash('confirmed');
-      const confirmation = await connection.confirmTransaction(
-        {
-          signature: txid,
-          blockhash: latestBlockhash.blockhash,
-          lastValidBlockHeight: latestBlockhash.lastValidBlockHeight,
-        },
-        'confirmed'
-      );
-
+      signature = bs58.encode(versionedTx.signatures[0]);
+      pending = { signature, walletAddress: context.walletAddress, tokenMint: context.tokenMint, action: context.action,
+        blockhash: versionedTx.message.recentBlockhash, lastValidBlockHeight: lastValidBlockHeight!, status: 'UNKNOWN', submittedAt: Date.now() };
+      this.loadPending().set(signature, pending);
+      this.persistPending();
+      const txid = await connection.sendRawTransaction(versionedTx.serialize(), { skipPreflight: false, maxRetries: 3, preflightCommitment: 'confirmed' });
+      if (txid !== signature) throw new Error('RPC returned a different signature');
+      const confirmation = await connection.confirmTransaction({ signature, blockhash: pending.blockhash,
+        lastValidBlockHeight: pending.lastValidBlockHeight }, 'confirmed');
       if (confirmation.value.err) {
-        return {
-          success: false,
-          txSignature: txid,
-          error: `Transaction confirmed with error: ${JSON.stringify(confirmation.value.err)}`,
-        };
+        this.loadPending().delete(signature);
+        this.persistPending();
+        return { success: false, status: 'FAILED', txSignature: signature, error: JSON.stringify(confirmation.value.err) };
       }
-
-      return {
-        success: true,
-        txSignature: txid,
-        explorerUrl: `https://solscan.io/tx/${txid}`,
-      };
+      const transaction = await connection.getTransaction(signature, { commitment: 'confirmed', maxSupportedTransactionVersion: 0 });
+      const fill = this.readConfirmedFill(transaction, context);
+      pending.status = 'CONFIRMED';
+      this.persistPending();
+      return { success: true, status: 'CONFIRMED', txSignature: signature, explorerUrl: `https://solscan.io/tx/${signature}`, fill };
     } catch (err: any) {
-      return {
-        success: false,
-        error: `Live transaction broadcast/confirmation failed: ${err.message || err}`,
-      };
+      if (pending) {
+        pending.error = err.message;
+        // Retain even when RPC send itself throws: the signed bytes may have reached a node.
+        this.loadPending().set(pending.signature, pending);
+        try { this.persistPending(); } catch { /* Keep the process-local block if disk fails. */ }
+      }
+      return { success: false, status: signature ? 'UNKNOWN' : 'REJECTED', txSignature: signature, error: err.message };
     }
   }
 
-  /**
-   * Constructs a real test transaction on Devnet (Micro self-transfer with memo)
-   * Used when network is Devnet because Jupiter DEX pools only exist on Mainnet.
-   * This creates a real, confirmed on-chain transaction that Phantom shows under Devnet!
-   */
-  public static async executeDevnetRealMicroTrade(
-    connection: Connection,
-    keypair: Keypair,
-    memoText: string = 'TokenTaker:DevnetTestTrade'
-  ): Promise<JupiterLiveExecutionResult> {
-    try {
-      const pubkey = keypair.publicKey;
-      const latestBlockhash = await connection.getLatestBlockhash('confirmed');
-
-      // Transfer 0.00001 SOL to itself to create real verifiable block on Devnet
-      const instruction = SystemProgram.transfer({
-        fromPubkey: pubkey,
-        toPubkey: pubkey,
-        lamports: 10_000, // 0.00001 SOL
-      });
-
-      const messageV0 = new TransactionMessage({
-        payerKey: pubkey,
-        recentBlockhash: latestBlockhash.blockhash,
-        instructions: [instruction],
-      }).compileToV0Message();
-
-      const versionedTx = new VersionedTransaction(messageV0);
-      versionedTx.sign([keypair]);
-
-      const txid = await connection.sendRawTransaction(versionedTx.serialize(), {
-        skipPreflight: false,
-        preflightCommitment: 'confirmed',
-      });
-
-      await connection.confirmTransaction(
-        {
-          signature: txid,
-          blockhash: latestBlockhash.blockhash,
-          lastValidBlockHeight: latestBlockhash.lastValidBlockHeight,
-        },
-        'confirmed'
-      );
-
-      return {
-        success: true,
-        txSignature: txid,
-        explorerUrl: `https://solscan.io/tx/${txid}?cluster=devnet`,
-      };
-    } catch (err: any) {
-      return {
-        success: false,
-        error: `Devnet live micro-trade failed: ${err.message || err}`,
-      };
-    }
+  public static async executeDevnetRealMicroTrade(_connection: Connection, _keypair: Keypair, _memoText?: string): Promise<JupiterLiveExecutionResult> {
+    return { success: false, status: 'REJECTED', error: 'Devnet self-transfers are not token trades; live swap unavailable' };
   }
 
-  /**
-   * Executes a real sell swap from token back into SOL on Jupiter DEX.
-   * Accurately inspects the on-chain SPL Token & Token-2022 balance to swap 100% (or 50%)
-   * of the actual token bag back into SOL on Solana mainnet.
-   */
-  public static async executeRealSellSwap(
-    connection: Connection,
-    keypair: Keypair,
-    tokenMint: string,
-    tokensRaw: number = 0,
-    slippageBps: number = 250,
-    pctToExit: number = 100
-  ): Promise<JupiterLiveExecutionResult> {
+  public static async executeRealSellSwap(connection: Connection, keypair: Keypair, tokenMint: string,
+    tokenBaseUnits: bigint | string | number = 0n, slippageBps = 250, pctToExit = 100,
+    finalGuard?: () => void): Promise<JupiterLiveExecutionResult> {
     try {
-      const pubkey = keypair.publicKey;
-
-      // 1. Check if network is Devnet: use real Devnet execution
-      let isDevnet = false;
-      try {
-        const genesis = await connection.getGenesisHash();
-        isDevnet = genesis === 'EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG';
-      } catch {
-        isDevnet = false;
+      if (process.env.ENABLE_LIVE_TRADING !== 'true' || !finalGuard) throw new Error('Live sell requires explicit interlock and wallet provenance guard');
+      // Caller supplies the exact already-sized slice; never derive it from the whole wallet.
+      if (typeof tokenBaseUnits === 'number' || !/^[1-9][0-9]*$/.test(String(tokenBaseUnits)) || pctToExit !== 100) {
+        throw new Error('Sell requires exact positive position base units, not human tokens or a wallet percentage');
       }
-
-      if (isDevnet) {
-        return this.executeDevnetRealMicroTrade(connection, keypair, `TokenTaker:Sell:${tokenMint.slice(0, 8)}`);
-      }
-
-      // 2. Query actual on-chain token balance across SPL Token and Token-2022 programs
-      const onChain = await getOnChainTokenBalance(connection, pubkey, new PublicKey(tokenMint));
-      if (onChain.total_base_units <= 0n && tokensRaw <= 0) {
-        return {
-          success: false,
-          error: `No on-chain token balance found for mint ${tokenMint.slice(0, 6)}...${tokenMint.slice(-4)}. The token may have already been sold or moved.`,
-        };
-      }
-
-      // If token balance is negligible sub-dust (< 1,000 base units, e.g. 0.000017 tokens), it was already fully liquidated
-      if (onChain.total_base_units > 0n && onChain.total_base_units < 1000n) {
-        return {
-          success: false,
-          error: `Token balance (${onChain.total_base_units} base units) is negligible dust. Position is already fully closed.`,
-        };
-      }
-
-      // Compute exact atomic raw units to sell
-      let sellAmountRaw: bigint;
-      if (onChain.total_base_units > 0n) {
-        sellAmountRaw = pctToExit <= 50 ? (onChain.total_base_units / 2n) : onChain.total_base_units;
-      } else {
-        sellAmountRaw = BigInt(Math.floor(tokensRaw));
-      }
-
-      if (sellAmountRaw < 1000n) {
-        return {
-          success: false,
-          error: `Calculated sell quantity (${sellAmountRaw} base units) is sub-dust. Swap aborted to protect fees.`,
-        };
-      }
-
-      // 3. Fetch sell quote from Jupiter (Token -> SOL) using exact atomic units
-      const quoteRes = await this.fetchQuote({
-        inputMint: tokenMint,
-        outputMint: SOL_MINT,
-        amountLamports: sellAmountRaw,
-        slippageBps,
+      const amount = BigInt(tokenBaseUnits);
+      const owner = keypair.publicKey.toBase58();
+      if (this.hasPendingExecution(owner, tokenMint)) throw new Error('Pending execution requires reconciliation');
+      finalGuard();
+      const balance = await getOnChainTokenBalance(connection, keypair.publicKey, new PublicKey(tokenMint));
+      if (balance.total_base_units < amount) throw new Error('Position quantity exceeds verified wallet balance');
+      const quote = await this.fetchQuote({ inputMint: tokenMint, outputMint: SOL_MINT, amountLamports: amount, slippageBps });
+      if (!quote.success || !quote.data) throw new Error(quote.error || 'Sell route unavailable');
+      const valid = await TradeSafetyValidator.validateQuote(connection, { intended_action: 'SELL', intended_token_mint: tokenMint,
+        intended_token_base_units: amount, quote_response: quote.data, wallet_pubkey: owner, max_slippage_bps: slippageBps });
+      if (valid.token_decimals !== balance.decimals) throw new Error('Mint decimals inconsistent');
+      const built = await this.buildSwapTransaction(quote.data, owner);
+      if (!built.success || !built.versionedTx) throw new Error(built.error || 'Sell build failed');
+      const result = await this.signAndExecuteSwap(connection, built.versionedTx, keypair, built.lastValidBlockHeight, {
+        action: 'SELL', tokenMint, walletAddress: owner, tokenDecimals: balance.decimals,
+        inputBaseUnits: amount.toString(), minimumOutputBaseUnits: quote.data.otherAmountThreshold,
+        quoteFetchedAt: quote.data.fetchedAt, finalGuard,
       });
-
-      if (!quoteRes.success || !quoteRes.data) {
-        return {
-          success: false,
-          error: quoteRes.error || 'Failed to obtain Jupiter sell quote for token.',
-        };
+      if (result.success && result.fill) {
+        result.tokensSold = toTokenHumanAmount(result.fill.tokenBaseUnits, result.fill.tokenDecimals);
+        result.solReceived = lamportsToSol(result.fill.solLamports);
+        result.outAmountSol = result.solReceived;
       }
-
-      // 4. HARD SAFETY VALIDATION BEFORE BUILDING / SIGNING
-      try {
-        await TradeSafetyValidator.validateQuote(connection, {
-          intended_action: 'SELL',
-          intended_token_mint: tokenMint,
-          intended_token_base_units: sellAmountRaw,
-          quote_response: quoteRes.data,
-          wallet_pubkey: pubkey.toBase58(),
-          max_slippage_bps: slippageBps,
-        });
-      } catch (valErr: any) {
-        console.error('[TradeSafety] SELL REJECTED:', valErr.message);
-        return {
-          success: false,
-          error: valErr.message || 'TRADE_REJECTED: SAFETY_VALIDATION_FAILED',
-        };
-      }
-
-      // 5. Build swap transaction
-      const buildRes = await this.buildSwapTransaction(quoteRes.data, pubkey.toBase58());
-      if (!buildRes.success || !buildRes.versionedTx) {
-        return {
-          success: false,
-          error: buildRes.error || 'Failed to compile sell transaction instructions.',
-        };
-      }
-
-      // 6. Validate compiled transaction
-      try {
-        TradeSafetyValidator.validateCompiledTransaction({
-          versioned_tx: buildRes.versionedTx,
-          wallet_pubkey: pubkey.toBase58(),
-          intended_action: 'SELL',
-          intended_token_mint: tokenMint,
-        });
-      } catch (txValErr: any) {
-        console.error('[TradeSafety] SELL TX REJECTED:', txValErr.message);
-        return {
-          success: false,
-          error: txValErr.message || 'TRADE_REJECTED: TRANSACTION_VALIDATION_FAILED',
-        };
-      }
-
-      // 7. Sign and broadcast
-      const execRes = await this.signAndExecuteSwap(connection, buildRes.versionedTx, keypair);
-      if (execRes.success && quoteRes.outAmount) {
-        const solReceived = lamportsToSol(quoteRes.outAmount);
-        const tokensSold = toTokenHumanAmount(sellAmountRaw, onChain.decimals);
-        execRes.inAmountSol = solReceived;
-        execRes.outAmountSol = solReceived;
-        execRes.solReceived = solReceived;
-        execRes.outAmountTokens = tokensSold;
-        execRes.tokensSold = tokensSold;
-      }
-      return execRes;
-    } catch (err: any) {
-      return {
-        success: false,
-        error: `Real sell swap failed: ${err.message || err}`,
-      };
-    }
+      return result;
+    } catch (err: any) { return { success: false, status: 'REJECTED', error: err.message }; }
   }
 }

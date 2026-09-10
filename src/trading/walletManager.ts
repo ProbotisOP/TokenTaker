@@ -88,6 +88,7 @@ export class WalletManager {
   // Dedicated Trading Keypair held strictly in the secure worker process
   private dedicatedKeypair: Keypair | null = null;
   private inFlightExits = new Set<string>();
+  private buyInFlight = false;
 
   private config: WalletAutotradeConfig = {
     walletAddress: null,
@@ -432,7 +433,7 @@ export class WalletManager {
       const pubkey = new PublicKey(this.config.walletAddress);
       const connection = new Connection(this.config.rpcEndpoint, 'confirmed');
       const lamports = await connection.getBalance(pubkey, 'confirmed');
-      const sol = Number((lamports / LAMPORTS_PER_SOL).toFixed(4));
+      const sol = lamports / LAMPORTS_PER_SOL;
       const usd = Number((sol * SOL_USD_ESTIMATE).toFixed(2));
 
       this.config.balanceSol = sol;
@@ -457,470 +458,237 @@ export class WalletManager {
       // Check balance floor kill switch
       const balanceRule = this.config.killSwitchRules.find((r) => r.id === 'RULE_BALANCE_FLOOR');
       if (balanceRule?.enabled && sol < balanceRule.thresholdValue && this.config.autotradeMode !== 'OFF') {
-        this.triggerKillSwitch(`Automated trigger: Balance ${sol} SOL fell below ${balanceRule.thresholdValue} SOL floor`);
+        void this.triggerKillSwitch(`Automated trigger: Balance ${sol} SOL fell below ${balanceRule.thresholdValue} SOL floor`).catch(() => {});
       }
 
       return { balanceSol: sol, balanceUsd: usd };
     } catch {
+      this.lastBalanceCheck = 0;
       return { balanceSol: this.config.balanceSol, balanceUsd: this.config.balanceUsd };
     }
   }
 
-  public triggerKillSwitch(reason: string): { success: boolean; config: WalletAutotradeConfig } {
+  public async triggerKillSwitch(reason: string): Promise<{ success: boolean; config: WalletAutotradeConfig; closedCount: number; message: string }> {
     this.config.killSwitchActive = true;
     this.config.killSwitchTriggeredReason = reason;
     this.config.killSwitchTriggeredAt = Date.now();
     this.config.autotradeMode = 'OFF';
-    this.flattenAllRealTrades();
-
-    return {
-      success: true,
-      config: this.getConfig(),
-    };
+    const flattened = await this.flattenAllRealTrades();
+    return { ...flattened, config: this.getConfig() };
   }
 
   public resetKillSwitch(): { success: boolean; config: WalletAutotradeConfig } {
     this.config.killSwitchActive = false;
     this.config.killSwitchTriggeredReason = undefined;
     this.config.killSwitchTriggeredAt = undefined;
-
-    return {
-      success: true,
-      config: this.getConfig(),
-    };
+    return { success: true, config: this.getConfig() };
   }
 
-  public flattenAllRealTrades(): { success: boolean; closedCount: number; message: string } {
-    const coordinator = EngineCoordinator.getInstance();
-    const realPositions = coordinator.activePositions.filter((p) => p.isRealWalletTrade);
+  public async flattenAllRealTrades(): Promise<{ success: boolean; closedCount: number; message: string }> {
+    const positions = [...EngineCoordinator.getInstance().activePositions].filter(p => p.isRealWalletTrade);
     let closedCount = 0;
-
-    for (const pos of realPositions) {
-      pos.status = 'CLOSED';
-      pos.closedAt = Date.now();
-      pos.exitReason = 'OPERATOR OR KILL SWITCH FLATTEN';
-      coordinator.portfolio.cashSol += pos.currentValueSol;
-      coordinator.closedPositions.unshift(pos);
-      closedCount++;
+    const failures: string[] = [];
+    for (const position of positions) {
+      try {
+        const result = await this.oneClickExit({ positionId: position.id, pctToExit: 100, reason: 'OPERATOR OR KILL SWITCH FLATTEN' });
+        if (result.success && result.isFullyClosed) closedCount++;
+        else failures.push(`${position.id}: ${result.error || 'not fully settled'}`);
+      } catch (error: any) { failures.push(`${position.id}: ${error.message}`); }
     }
-
-    coordinator.activePositions = coordinator.activePositions.filter((p) => !p.isRealWalletTrade);
-    coordinator.recalculatePortfolio();
-
-    return {
-      success: true,
-      closedCount,
-      message: `Flattened ${closedCount} active real wallet trades.`,
-    };
+    return { success: failures.length === 0, closedCount,
+      message: `Confirmed ${closedCount}/${positions.length} exits.${failures.length ? ` Retained unresolved positions: ${failures.join('; ')}` : ''}` };
   }
 
   public setMaxOpenPositions(limit: number): WalletAutotradeConfig {
-    this.config.maxOpenPositions = Math.max(1, Math.min(20, limit));
+    if (!Number.isInteger(limit) || limit < 1 || limit > 20) throw new Error('Invalid open position limit');
+    this.config.maxOpenPositions = limit;
     return this.getConfig();
   }
 
-  /**
-   * 1-Click Enroll into a real on-chain trade.
-   * Signs with dedicated trading keypair, broadcasts to Solana AMM/DEX, confirms on Solana.
-   */
-  public async oneClickEnroll(req: OneClickEnrollRequest): Promise<OneClickEnrollResult> {
-    const timestamp = Date.now();
+  public getPendingExecutions() { return JupiterService.getPendingExecutions(); }
 
-    if (!this.dedicatedKeypair) {
-      return {
-        success: false,
-        tokenMint: req.tokenMint,
-        symbol: req.symbol,
-        sizeSol: req.sizeSol,
-        timestamp,
-        error: 'Dedicated trading keypair missing in worker. Please configure a keypair in Step 1.',
-      };
-    }
-
-    if (!this.config.lastPreflightPassed) {
-      return {
-        success: false,
-        tokenMint: req.tokenMint,
-        symbol: req.symbol,
-        sizeSol: req.sizeSol,
-        timestamp,
-        error: 'Live Preflight Diagnostic has not passed. Run the 11-point diagnostic check in Step 2 first.',
-      };
-    }
-
-    if (this.config.killSwitchActive) {
-      return {
-        success: false,
-        tokenMint: req.tokenMint,
-        symbol: req.symbol,
-        sizeSol: req.sizeSol,
-        timestamp,
-        error: `Kill switch is engaged: "${this.config.killSwitchTriggeredReason || 'Operator halt'}". Reset kill switch to trade.`,
-      };
-    }
-
-    await this.refreshBalance();
-    const minNeeded = this.config.gasReserveSol + req.sizeSol;
-    if (this.config.balanceSol < minNeeded) {
-      return {
-        success: false,
-        tokenMint: req.tokenMint,
-        symbol: req.symbol,
-        sizeSol: req.sizeSol,
-        timestamp,
-        error: `Insufficient SOL balance (${this.config.balanceSol.toFixed(3)} SOL). Need at least ${minNeeded.toFixed(3)} SOL (${req.sizeSol} SOL trade + ${this.config.gasReserveSol} SOL gas reserve).`,
-      };
-    }
-
-    let priceSol = req.priceSol || 0.00042;
-    let priceUsd = req.priceUsd || priceSol * SOL_USD_ESTIMATE;
-    let sizeTokens = Math.floor(req.sizeSol / priceSol);
-    let realizedEntryPriceSol = priceSol;
-
-    let realTxSig: string;
-    let explorerUrl: string;
-
-    const connection = new Connection(this.config.rpcEndpoint, 'confirmed');
-
-    if (this.config.network === 'mainnet-beta') {
-      const lamports = solToLamports(req.sizeSol);
-      const slippageBps = req.slippageBps || 200;
-      const quoteRes = await JupiterService.fetchQuote({
-        inputMint: SOL_MINT,
-        outputMint: req.tokenMint,
-        amountLamports: lamports,
-        slippageBps,
-      });
-
-      if (!quoteRes.success || !quoteRes.data) {
-        return {
-          success: false,
-          tokenMint: req.tokenMint,
-          symbol: req.symbol,
-          sizeSol: req.sizeSol,
-          timestamp,
-          error: `DEX quote failed for $${req.symbol}: ${quoteRes.error || 'No route found'}`,
-        };
-      }
-
-      // PRE-EXECUTION SAFETY GATES VALIDATION
-      let token_decimals = 6;
-      try {
-        const valRes = await TradeSafetyValidator.validateQuote(connection, {
-          intended_action: 'BUY',
-          intended_token_mint: req.tokenMint,
-          intended_sol_lamports: lamports,
-          quote_response: quoteRes.data,
-          wallet_pubkey: this.dedicatedKeypair.publicKey.toBase58(),
-          max_slippage_bps: slippageBps,
-        });
-        token_decimals = valRes.token_decimals;
-      } catch (valErr: any) {
-        console.error('[TradeSafety] BUY REJECTED in oneClickEnroll:', valErr.message);
-        return {
-          success: false,
-          tokenMint: req.tokenMint,
-          symbol: req.symbol,
-          sizeSol: req.sizeSol,
-          timestamp,
-          error: valErr.message || 'TRADE_REJECTED: SAFETY_VALIDATION_FAILED',
-        };
-      }
-
-      const buildRes = await JupiterService.buildSwapTransaction(
-        quoteRes.data,
-        this.dedicatedKeypair.publicKey.toBase58(),
-        150_000
-      );
-
-      if (!buildRes.success || !buildRes.versionedTx) {
-        return {
-          success: false,
-          tokenMint: req.tokenMint,
-          symbol: req.symbol,
-          sizeSol: req.sizeSol,
-          timestamp,
-          error: `Swap transaction build failed: ${buildRes.error}`,
-        };
-      }
-
-      // TRANSACTION SIGNER VALIDATION BEFORE SIGNING
-      try {
-        TradeSafetyValidator.validateCompiledTransaction({
-          versioned_tx: buildRes.versionedTx,
-          wallet_pubkey: this.dedicatedKeypair.publicKey.toBase58(),
-          intended_action: 'BUY',
-          intended_token_mint: req.tokenMint,
-        });
-      } catch (txValErr: any) {
-        console.error('[TradeSafety] BUY TX REJECTED in oneClickEnroll:', txValErr.message);
-        return {
-          success: false,
-          tokenMint: req.tokenMint,
-          symbol: req.symbol,
-          sizeSol: req.sizeSol,
-          timestamp,
-          error: txValErr.message || 'TRADE_REJECTED: TRANSACTION_VALIDATION_FAILED',
-        };
-      }
-
-      const execRes = await JupiterService.signAndExecuteSwap(
-        connection,
-        buildRes.versionedTx,
-        this.dedicatedKeypair
-      );
-
-      if (!execRes.success || !execRes.txSignature) {
-        return {
-          success: false,
-          tokenMint: req.tokenMint,
-          symbol: req.symbol,
-          sizeSol: req.sizeSol,
-          timestamp,
-          error: `On-chain swap broadcast failed: ${execRes.error}`,
-        };
-      }
-
-      realTxSig = execRes.txSignature;
-      explorerUrl = execRes.explorerUrl || `https://solscan.io/tx/${realTxSig}`;
-
-      // Accurate decimal-safe accounting from verified quote outAmount
-      const out_base_units = BigInt(quoteRes.data.outAmount);
-      const actual_tokens = toTokenHumanAmount(out_base_units, token_decimals);
-      if (actual_tokens > 0) {
-        sizeTokens = actual_tokens;
-        realizedEntryPriceSol = req.sizeSol / actual_tokens;
-        priceSol = realizedEntryPriceSol;
-        priceUsd = priceSol * SOL_USD_ESTIMATE;
-      }
-    } else {
-      // Devnet live real trade
-      const execRes = await JupiterService.executeDevnetRealMicroTrade(
-        connection,
-        this.dedicatedKeypair,
-        `TokenTaker:Buy:${req.symbol}`
-      );
-
-      if (!execRes.success || !execRes.txSignature) {
-        return {
-          success: false,
-          tokenMint: req.tokenMint,
-          symbol: req.symbol,
-          sizeSol: req.sizeSol,
-          timestamp,
-          error: `Devnet trade execution failed: ${execRes.error}`,
-        };
-      }
-
-      realTxSig = execRes.txSignature;
-      explorerUrl = execRes.explorerUrl || `https://solscan.io/tx/${realTxSig}?cluster=devnet`;
-    }
-
-    // Register active position on coordinator
-    const coordinator = EngineCoordinator.getInstance();
-    const posId = `POS_LIVE_${req.symbol}_${Date.now()}`;
-    const ladder = ExitEngine.createLadder(priceSol);
-
-    const livePosition: Position = {
-      id: posId,
-      tokenMint: req.tokenMint,
-      symbol: req.symbol,
-      name: req.name || req.symbol,
-      entryPriceSol: realizedEntryPriceSol,
-      entryPriceUsd: realizedEntryPriceSol * SOL_USD_ESTIMATE,
-      currentPriceSol: realizedEntryPriceSol,
-      currentPriceUsd: realizedEntryPriceSol * SOL_USD_ESTIMATE,
-      peakPriceUsd: priceUsd,
-      lowestPriceUsd: priceUsd,
-      sizeTokens,
-      costBasisSol: req.sizeSol,
-      currentValueSol: req.sizeSol,
-      unrealizedPnlSol: 0,
-      unrealizedPnlPct: 0,
-      realizedPnlSol: 0,
-      enteredAt: timestamp,
-      holdingSec: 0,
-      stopLossPriceSol: priceSol * (1 + this.config.defaultStopLossPct / 100),
-      takeProfitLadder: [
-        { targetPriceSol: priceSol * (1 + this.config.takeProfitTier1Pct / 100), pctToSell: 50, filled: false },
-        { targetPriceSol: priceSol * (1 + this.config.takeProfitTier2Pct / 100), pctToSell: 50, filled: false },
-      ],
-      trailingStopPriceSol: ladder.trailingStopPriceSol,
-      trailingActivated: false,
-      status: 'OPEN',
-      isRealWalletTrade: true,
-      executionType: 'LIVE_ON_CHAIN',
-      isSimulated: false,
-      walletAddress: this.dedicatedKeypair.publicKey.toBase58(),
-      executionVenue: this.config.network === 'devnet' ? 'Solana Devnet' : 'Jupiter DEX / Solana Mainnet',
-      txSignature: realTxSig,
-      solscanUrl: explorerUrl,
-      executionHistory: [
-        {
-          action: 'BUY',
-          priceSol: realizedEntryPriceSol,
-          tokens: sizeTokens,
-          pnlSol: 0,
-          timestamp,
-          txSignature: realTxSig,
-        },
-      ],
-    };
-
-    coordinator.activePositions.unshift(livePosition);
-    coordinator.portfolio.cashSol -= req.sizeSol;
-    coordinator.recalculatePortfolio();
-
-    await this.refreshBalance();
-
-    return {
-      success: true,
-      txSignature: realTxSig,
-      explorerUrl,
-      positionId: posId,
-      tokenMint: req.tokenMint,
-      symbol: req.symbol,
-      sizeSol: req.sizeSol,
-      tokensReceived: sizeTokens,
-      priceSol: realizedEntryPriceSol,
-      timestamp,
-    };
+  private assertWalletProvenance(position?: Position): void {
+    if (process.env.ENABLE_LIVE_TRADING !== 'true') throw new Error('ENABLE_LIVE_TRADING must explicitly equal true');
+    if (!this.dedicatedKeypair || !this.config.isConnected || this.config.network !== 'mainnet-beta') throw new Error('Live mainnet signing wallet unavailable');
+    const owner = this.dedicatedKeypair.publicKey.toBase58();
+    if (this.config.walletAddress !== owner) throw new Error('Active wallet differs from dedicated signer');
+    if (position && (!position.isRealWalletTrade || position.isSimulated || position.executionType !== 'LIVE_ON_CHAIN' ||
+        position.walletAddress !== owner || position.status !== 'OPEN')) throw new Error('Paper, foreign-wallet or non-open position cannot be sold live');
   }
 
-  /**
-   * 1-Click Exit from a real on-chain trade.
-   * Executes a real DEX sell swap (Token -> SOL) signed by dedicated keypair and confirmed on Solana.
-   */
-  public async oneClickExit(req: OneClickExitRequest): Promise<OneClickExitResult> {
+  private assertBuyAllowed(req: OneClickEnrollRequest): void {
+    this.assertWalletProvenance();
+    const c = this.config;
+    const coordinator = EngineCoordinator.getInstance();
+    if (coordinator.config.mode !== 'LIVE' || coordinator.riskLimits.circuitBreakerActive || c.killSwitchActive ||
+        !['FULL_AUTONOMOUS', 'SEMI_AUTONOMOUS'].includes(c.autotradeMode) || !c.lastPreflightPassed) throw new Error('Live buy blocked by mode, preflight or circuit breaker');
+    const values = [req.sizeSol, c.minTradeSizeSol, c.maxTradeSizeSol, c.gasReserveSol, c.allocatedCapitalSol,
+      c.balanceSol, c.maxOpenPositions, c.maxSlippagePct, c.maxDailyLossSol, c.maxDailyDrawdownPct];
+    if (values.some(v => !Number.isFinite(v) || v < 0) || req.sizeSol <= 0) throw new Error('Invalid buy size or risk configuration');
+    const amount = lamportsToSol(solToLamports(req.sizeSol));
+    if (amount < c.minTradeSizeSol || amount > c.maxTradeSizeSol) throw new Error('Trade size outside configured limits');
+    const slippage = req.slippageBps ?? Math.floor(c.maxSlippagePct * 100);
+    if (!Number.isInteger(slippage) || slippage < 0 || slippage > c.maxSlippagePct * 100) throw new Error('Invalid buy slippage');
+    if (Date.now() - this.lastBalanceCheck > 15_000 || !this.lastBalanceCheck) throw new Error('Fresh on-chain balance required');
+    if (amount + c.gasReserveSol + 0.003 > c.balanceSol) throw new Error('Insufficient cash after gas, fee and rent reserve');
+    const open = coordinator.activePositions.filter(p => p.isRealWalletTrade && p.status === 'OPEN');
+    const limits = coordinator.riskLimits;
+    if (![limits.maxPositionPercent, limits.maxTokenExposurePercent, limits.maxOpenPositions, limits.maxTradeLossSol]
+      .every(v => Number.isFinite(v) && v > 0) ||
+        amount > coordinator.portfolio.equitySol * Math.min(limits.maxPositionPercent, limits.maxTokenExposurePercent) ||
+        amount > limits.maxTradeLossSol || open.length >= limits.maxOpenPositions) throw new Error('System position, exposure or loss cap exceeded');
+    if (open.length >= c.maxOpenPositions || open.some(p => p.tokenMint === req.tokenMint)) throw new Error('Open-position or duplicate-mint limit');
+    if (open.reduce((n, p) => n + p.costBasisSol, 0) + amount > c.allocatedCapitalSol) throw new Error('Allocated capital cap exceeded');
+    if (coordinator.portfolio.dailyRealizedPnlSol <= -c.maxDailyLossSol ||
+        coordinator.portfolio.currentDrawdownPct >= c.maxDailyDrawdownPct ||
+        coordinator.portfolio.consecutiveLosses >= coordinator.riskLimits.maxConsecutiveLosses) throw new Error('Wallet loss limit reached');
+    if (JupiterService.hasPendingExecution(c.walletAddress!)) throw new Error('Pending wallet execution requires reconciliation before buying');
+  }
+
+  public async oneClickEnroll(req: OneClickEnrollRequest, signalGuard?: { validate: () => void; maxEntryPriceSol: number }): Promise<OneClickEnrollResult> {
+    const timestamp = Date.now();
+    const failure = (error: string, txSignature?: string): OneClickEnrollResult => ({ success: false, tokenMint: req.tokenMint,
+      symbol: req.symbol, sizeSol: req.sizeSol, timestamp, error, txSignature });
+    if (this.buyInFlight) return failure('Another wallet buy is in progress');
+    this.buyInFlight = true;
+    try {
+      this.assertWalletProvenance();
+      await this.refreshBalance();
+      this.assertBuyAllowed(req);
+      const signer = this.dedicatedKeypair!;
+      const endpoint = this.config.rpcEndpoint;
+      const connection = new Connection(endpoint, 'confirmed');
+      const amount = solToLamports(req.sizeSol);
+      const slippageBps = req.slippageBps ?? Math.floor(this.config.maxSlippagePct * 100);
+      const quote = await JupiterService.fetchQuote({ inputMint: SOL_MINT, outputMint: req.tokenMint, amountLamports: amount, slippageBps });
+      if (!quote.success || !quote.data) return failure(quote.error || 'Buy route unavailable');
+      const valid = await TradeSafetyValidator.validateQuote(connection, { intended_action: 'BUY', intended_token_mint: req.tokenMint,
+        intended_sol_lamports: amount, quote_response: quote.data, wallet_pubkey: signer.publicKey.toBase58(), max_slippage_bps: slippageBps });
+      if (signalGuard) {
+        const worstPrice = req.sizeSol / toTokenHumanAmount(quote.data.otherAmountThreshold, valid.token_decimals);
+        if (!Number.isFinite(worstPrice) || worstPrice > signalGuard.maxEntryPriceSol) return failure('Execution price exceeds the no-chase entry ceiling');
+      }
+      const built = await JupiterService.buildSwapTransaction(quote.data, signer.publicKey.toBase58(), 150_000);
+      if (!built.success || !built.versionedTx) return failure(built.error || 'Buy build failed');
+      await this.refreshBalance();
+      const finalGuard = () => {
+        if (this.dedicatedKeypair !== signer || this.config.rpcEndpoint !== endpoint) throw new Error('Signing context changed');
+        this.assertBuyAllowed(req);
+        signalGuard?.validate();
+      };
+      finalGuard();
+      const result = await JupiterService.signAndExecuteSwap(connection, built.versionedTx, signer, built.lastValidBlockHeight, {
+        action: 'BUY', tokenMint: req.tokenMint, walletAddress: signer.publicKey.toBase58(), tokenDecimals: valid.token_decimals,
+        inputBaseUnits: amount.toString(), minimumOutputBaseUnits: quote.data.otherAmountThreshold,
+        quoteFetchedAt: quote.data.fetchedAt, finalGuard,
+      });
+      if (!result.success || result.status !== 'CONFIRMED' || !result.txSignature || !result.fill) return failure(result.error || 'Confirmed fill metadata required', result.txSignature);
+      const tokens = toTokenHumanAmount(result.fill.tokenBaseUnits, result.fill.tokenDecimals);
+      const actualCost = lamportsToSol(result.fill.solLamports);
+      if (!Number.isFinite(tokens) || tokens <= 0 || !Number.isFinite(actualCost) || actualCost <= 0) return failure('Invalid confirmed fill; reconciliation required', result.txSignature);
+      const price = actualCost / tokens;
+      const ladder = ExitEngine.createLadder(price);
+      const position: Position & { sizeBaseUnits: string; tokenDecimals: number; peakPriceSol: number } = {
+        id: `POS_LIVE_${result.txSignature}`, tokenMint: req.tokenMint, symbol: req.symbol, name: req.name || req.symbol,
+        entryPriceSol: price, entryPriceUsd: price * SOL_USD_ESTIMATE, currentPriceSol: price, currentPriceUsd: price * SOL_USD_ESTIMATE,
+        peakPriceSol: price, peakPriceUsd: price * SOL_USD_ESTIMATE, lowestPriceUsd: price * SOL_USD_ESTIMATE,
+        sizeTokens: tokens, sizeBaseUnits: result.fill.tokenBaseUnits, tokenDecimals: result.fill.tokenDecimals,
+        costBasisSol: actualCost, currentValueSol: actualCost, unrealizedPnlSol: 0, unrealizedPnlPct: 0, realizedPnlSol: 0,
+        enteredAt: timestamp, holdingSec: 0, stopLossPriceSol: price * (1 + this.config.defaultStopLossPct / 100),
+        takeProfitLadder: [
+          { targetPriceSol: price * (1 + this.config.takeProfitTier1Pct / 100), pctToSell: 50, filled: false },
+          { targetPriceSol: price * (1 + this.config.takeProfitTier2Pct / 100), pctToSell: 50, filled: false },
+        ], trailingStopPriceSol: ladder.trailingStopPriceSol, trailingActivated: false, status: 'OPEN',
+        isRealWalletTrade: true, executionType: 'LIVE_ON_CHAIN', isSimulated: false, walletAddress: signer.publicKey.toBase58(),
+        executionVenue: 'Jupiter DEX / Solana Mainnet', txSignature: result.txSignature, solscanUrl: result.explorerUrl,
+        executionHistory: [{ action: 'BUY', priceSol: price, tokens, pnlSol: 0, timestamp, txSignature: result.txSignature }],
+      };
+      const coordinator = EngineCoordinator.getInstance();
+      coordinator.activePositions.unshift(position);
+      coordinator.portfolio.cashSol -= actualCost;
+      this.config.balanceSol = Math.max(0, this.config.balanceSol - actualCost);
+      coordinator.recalculatePortfolio();
+      coordinator.persistSettlement(result.txSignature);
+      JupiterService.acknowledgeSettlement(result.txSignature);
+      return { success: true, txSignature: result.txSignature, explorerUrl: result.explorerUrl, positionId: position.id,
+        tokenMint: req.tokenMint, symbol: req.symbol, sizeSol: actualCost, tokensReceived: tokens, priceSol: price, timestamp };
+    } catch (error: any) { return failure(error.message); }
+    finally { this.buyInFlight = false; }
+  }
+
+  public async oneClickExit(req: OneClickExitRequest & { tierIndex?: number }): Promise<OneClickExitResult> {
     const timestamp = Date.now();
     const coordinator = EngineCoordinator.getInstance();
-    const coordPos = coordinator.activePositions.find((p) => p.id === req.positionId);
-
-    if (!coordPos) {
-      return {
-        success: false,
-        positionId: req.positionId,
-        symbol: 'UNKNOWN',
-        isFullyClosed: false,
-        timestamp,
-        error: `Position ${req.positionId} not found among active positions.`,
-      };
-    }
-
-    if (!this.dedicatedKeypair) {
-      return {
-        success: false,
-        positionId: req.positionId,
-        symbol: coordPos.symbol,
-        isFullyClosed: false,
-        timestamp,
-        error: 'Dedicated trading keypair missing in worker.',
-      };
-    }
-
-    if (this.inFlightExits.has(req.positionId)) {
-      return {
-        success: false,
-        positionId: req.positionId,
-        symbol: coordPos.symbol,
-        isFullyClosed: false,
-        timestamp,
-        error: `Exit swap is already in progress for position ${req.positionId}.`,
-      };
-    }
-
-    this.inFlightExits.add(req.positionId);
+    const position = coordinator.activePositions.find(p => p.id === req.positionId) as (Position & { sizeBaseUnits?: string; tokenDecimals?: number }) | undefined;
+    const failure = (error: string, txSignature?: string): OneClickExitResult => ({ success: false, positionId: req.positionId,
+      symbol: position?.symbol || 'UNKNOWN', isFullyClosed: false, timestamp, error, txSignature });
+    if (!position) return failure('Position not found');
+    if (this.inFlightExits.has(position.tokenMint)) return failure('Exit already in progress for this mint');
+    this.inFlightExits.add(position.tokenMint);
     try {
-      const pctToExit = req.pctToExit || 100;
-    const isFullExit = pctToExit === 100;
-    const tokensToSell = isFullExit ? coordPos.sizeTokens : Math.floor(coordPos.sizeTokens * 0.5);
-    const costBasisPortion = isFullExit ? coordPos.costBasisSol : coordPos.costBasisSol * 0.5;
-
-    const connection = new Connection(this.config.rpcEndpoint, 'confirmed');
-
-    // Execute real on-chain sell swap
-    const sellRes = await JupiterService.executeRealSellSwap(
-      connection,
-      this.dedicatedKeypair,
-      coordPos.tokenMint,
-      tokensToSell,
-      req.slippageBps || 250,
-      pctToExit
-    );
-
-    if (!sellRes.success || !sellRes.txSignature) {
-      return {
-        success: false,
-        positionId: req.positionId,
-        symbol: coordPos.symbol,
-        isFullyClosed: false,
-        timestamp,
-        error: `On-chain sell swap failed: ${sellRes.error || 'Transaction rejected'}`,
+      this.assertWalletProvenance(position);
+      const pct = req.pctToExit ?? 100;
+      if (!Number.isInteger(pct) || pct <= 0 || pct > 100) return failure('Invalid exit percentage');
+      const slippage = req.slippageBps ?? Math.floor(this.config.maxSlippagePct * 100);
+      if (!Number.isInteger(slippage) || slippage < 0 || slippage > this.config.maxSlippagePct * 100) return failure('Invalid exit slippage');
+      if (!position.sizeBaseUnits || !/^[1-9][0-9]*$/.test(position.sizeBaseUnits) || !Number.isInteger(position.tokenDecimals)) {
+        return failure('Exact position base units and verified decimals required; reconcile legacy position before selling');
+      }
+      if (!Number.isFinite(position.sizeTokens) || position.sizeTokens <= 0 || !Number.isFinite(position.costBasisSol) || position.costBasisSol < 0 ||
+          !Number.isFinite(position.currentPriceSol) || position.currentPriceSol <= 0) return failure('Invalid position accounting');
+      const originalUnits = BigInt(position.sizeBaseUnits);
+      const originalBasis = position.costBasisSol;
+      const units = originalUnits * BigInt(pct) / 100n;
+      if (units <= 0n) return failure('Exit rounds to zero base units');
+      if (req.tierIndex !== undefined && (!Number.isInteger(req.tierIndex) || !position.takeProfitLadder[req.tierIndex] || position.takeProfitLadder[req.tierIndex].filled)) return failure('Invalid or already-filled take-profit tier');
+      const signer = this.dedicatedKeypair!;
+      const endpoint = this.config.rpcEndpoint;
+      const finalGuard = () => {
+        this.assertWalletProvenance(position);
+        if (this.dedicatedKeypair !== signer || this.config.rpcEndpoint !== endpoint ||
+            !coordinator.activePositions.includes(position) || position.sizeBaseUnits !== originalUnits.toString() || position.costBasisSol !== originalBasis) throw new Error('Exit signing context changed');
       };
-    }
-
-    const actualTokensSold = sellRes.tokensSold || sellRes.outAmountTokens || tokensToSell;
-    const solReceived = sellRes.solReceived || sellRes.outAmountSol || sellRes.inAmountSol || (coordPos.currentPriceSol * actualTokensSold);
-    const realizedPnl = solReceived - costBasisPortion;
-
-    if (isFullExit) {
-      coordPos.status = 'CLOSED';
-      coordPos.closedAt = timestamp;
-      coordPos.exitReason = req.reason || '1_CLICK_MARKET_EXIT';
-      coordPos.realizedPnlSol = (coordPos.realizedPnlSol || 0) + realizedPnl;
-      coordPos.exitTxSignature = sellRes.txSignature;
-      coordPos.exitSolscanUrl = `https://solscan.io/tx/${sellRes.txSignature}`;
-      coordPos.executionHistory.push({
-        action: 'SELL',
-        priceSol: actualTokensSold > 0 ? solReceived / actualTokensSold : coordPos.currentPriceSol,
-        tokens: actualTokensSold,
-        pnlSol: realizedPnl,
-        timestamp,
-        txSignature: sellRes.txSignature,
-      });
-
-      coordinator.portfolio.cashSol += solReceived;
-      coordinator.portfolio.dailyRealizedPnlSol += realizedPnl;
-      coordinator.portfolio.totalRealizedPnlSol += realizedPnl;
-      coordinator.closedPositions.unshift(coordPos);
-      coordinator.activePositions = coordinator.activePositions.filter((p) => p.id !== req.positionId);
-    } else {
-      coordPos.sizeTokens = Math.max(0, coordPos.sizeTokens - actualTokensSold);
-      coordPos.costBasisSol -= costBasisPortion;
-      coordPos.realizedPnlSol = (coordPos.realizedPnlSol || 0) + realizedPnl;
-      coordPos.executionHistory.push({
-        action: 'SCALE_OUT',
-        priceSol: actualTokensSold > 0 ? solReceived / actualTokensSold : coordPos.currentPriceSol,
-        tokens: actualTokensSold,
-        pnlSol: realizedPnl,
-        timestamp,
-        txSignature: sellRes.txSignature,
-      });
-
-      coordinator.portfolio.cashSol += solReceived;
-      coordinator.portfolio.dailyRealizedPnlSol += realizedPnl;
-      coordinator.portfolio.totalRealizedPnlSol += realizedPnl;
-    }
-
-    coordinator.recalculatePortfolio();
-    await this.refreshBalance();
-
-    return {
-      success: true,
-      txSignature: sellRes.txSignature,
-      explorerUrl: sellRes.explorerUrl,
-      positionId: req.positionId,
-      symbol: coordPos.symbol,
-      solReceived,
-      tokensSold: actualTokensSold,
-      remainingTokens: isFullExit ? 0 : coordPos.sizeTokens,
-      isFullyClosed: isFullExit,
-      message: `Successfully sold ${isFullExit ? '100%' : '50%'} of $${coordPos.symbol} on-chain for ${solReceived.toFixed(4)} SOL.`,
-      timestamp,
-    };
-    } finally {
-      this.inFlightExits.delete(req.positionId);
-    }
+      const result = await JupiterService.executeRealSellSwap(new Connection(endpoint, 'confirmed'), signer,
+        position.tokenMint, units, slippage, 100, finalGuard);
+      if (!result.success || result.status !== 'CONFIRMED' || !result.txSignature || !result.fill) return failure(result.error || 'Confirmed fill metadata required', result.txSignature);
+      const soldUnits = BigInt(result.fill.tokenBaseUnits);
+      if (soldUnits <= 0n || soldUnits > originalUnits || result.fill.tokenDecimals !== position.tokenDecimals) return failure('Unverifiable filled position quantity; reconciliation required', result.txSignature);
+      const tokensSold = toTokenHumanAmount(soldUnits, result.fill.tokenDecimals);
+      const proceeds = lamportsToSol(result.fill.solLamports);
+      if (!Number.isFinite(proceeds) || proceeds <= 0) return failure('Unverifiable proceeds; reconciliation required', result.txSignature);
+      const basis = originalBasis * Number(soldUnits) / Number(originalUnits);
+      const pnl = proceeds - basis;
+      const remaining = originalUnits - soldUnits;
+      const fullyClosed = remaining === 0n;
+      position.sizeBaseUnits = remaining.toString();
+      position.sizeTokens = toTokenHumanAmount(remaining, result.fill.tokenDecimals);
+      position.costBasisSol = fullyClosed ? 0 : originalBasis - basis;
+      position.currentValueSol = position.sizeTokens * position.currentPriceSol;
+      position.unrealizedPnlSol = position.currentValueSol - position.costBasisSol;
+      position.unrealizedPnlPct = position.costBasisSol > 0 ? position.unrealizedPnlSol / position.costBasisSol * 100 : 0;
+      position.realizedPnlSol += pnl;
+      position.executionHistory.push({ action: fullyClosed ? 'SELL' : 'SCALE_OUT', priceSol: proceeds / tokensSold,
+        tokens: tokensSold, pnlSol: pnl, timestamp, txSignature: result.txSignature });
+      if (req.tierIndex !== undefined && soldUnits === units) position.takeProfitLadder[req.tierIndex].filled = true;
+      coordinator.portfolio.cashSol += proceeds;
+      coordinator.portfolio.dailyRealizedPnlSol += pnl;
+      coordinator.portfolio.totalRealizedPnlSol += pnl;
+      this.config.balanceSol += proceeds;
+      if (fullyClosed) {
+        position.status = 'CLOSED'; position.closedAt = timestamp; position.exitReason = req.reason || '1_CLICK_MARKET_EXIT';
+        position.exitTxSignature = result.txSignature; position.exitSolscanUrl = result.explorerUrl;
+        coordinator.activePositions = coordinator.activePositions.filter(p => p !== position);
+        coordinator.closedPositions.unshift(position);
+        coordinator.portfolio.consecutiveLosses = position.realizedPnlSol < 0 ? coordinator.portfolio.consecutiveLosses + 1 : 0;
+      }
+      coordinator.recalculatePortfolio();
+      coordinator.persistSettlement(result.txSignature);
+      JupiterService.acknowledgeSettlement(result.txSignature);
+      return { success: true, positionId: position.id, symbol: position.symbol, txSignature: result.txSignature, explorerUrl: result.explorerUrl,
+        solReceived: proceeds, tokensSold, remainingTokens: position.sizeTokens, isFullyClosed: fullyClosed,
+        message: 'Settled confirmed on-chain fill', timestamp };
+    } catch (error: any) { return failure(error.message); }
+    finally { this.inFlightExits.delete(position.tokenMint); }
   }
 
   public async executeTradeExit(
@@ -964,7 +732,10 @@ export class WalletManager {
 
       if (action === 'CUSTOM_SL_TP') {
         const slPct = params?.customStopLossPct ?? -10;
-        coordPos.trailingStopPriceSol = coordPos.entryPriceSol * (1 + slPct / 100);
+        const tpPct = params?.customTakeProfitPct;
+        if (!Number.isFinite(slPct) || slPct <= -100 || slPct > 0 || (tpPct !== undefined && (!Number.isFinite(tpPct) || tpPct <= 0))) return { success: false, message: 'Invalid custom stop or take-profit percentage' };
+        coordPos.stopLossPriceSol = coordPos.entryPriceSol * (1 + slPct / 100);
+        if (tpPct !== undefined) coordPos.takeProfitLadder = [{ targetPriceSol: coordPos.entryPriceSol * (1 + tpPct / 100), pctToSell: 100, filled: false }];
         return {
           success: true,
           message: `Custom SL updated for $${coordPos.symbol} to ${slPct}%.`,
@@ -984,101 +755,23 @@ export class WalletManager {
    * and executes a Jupiter sell swap for each non-zero token back into pure SOL.
    */
   public async reclaimAllTokenHoldingsToSol(): Promise<{
-    success: boolean;
-    swappedCount: number;
-    totalSolReclaimed: number;
+    success: boolean; swappedCount: number; totalSolReclaimed: number;
     results: { mint: string; amountUi: number; solReceived: number; txSignature?: string; error?: string }[];
   }> {
-    if (!this.dedicatedKeypair) {
-      return { success: false, swappedCount: 0, totalSolReclaimed: 0, results: [] };
+    // Untracked wallet balances are not positions. Never liquidate them as a shortcut.
+    const positions = [...EngineCoordinator.getInstance().activePositions].filter(p => p.isRealWalletTrade);
+    const results = [];
+    for (const position of positions) {
+      const amountUi = position.sizeTokens;
+      const result = await this.oneClickExit({ positionId: position.id, pctToExit: 100, reason: 'RECLAIM_TRACKED_POSITION' });
+      results.push({ mint: position.tokenMint, amountUi, solReceived: result.solReceived ?? 0,
+        txSignature: result.txSignature, error: result.error });
     }
-
-    const connection = new Connection(this.config.rpcEndpoint, 'confirmed');
-    const pubkey = this.dedicatedKeypair.publicKey;
-
-    const [splAccounts, token2022Accounts] = await Promise.all([
-      connection.getParsedTokenAccountsByOwner(pubkey, {
-        programId: new PublicKey('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA'),
-      }).catch(() => ({ value: [] })),
-      connection.getParsedTokenAccountsByOwner(pubkey, {
-        programId: new PublicKey('TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb'),
-      }).catch(() => ({ value: [] })),
-    ]);
-
-    const results: { mint: string; amountUi: number; solReceived: number; txSignature?: string; error?: string }[] = [];
-    let totalSolReclaimed = 0;
-    const coordinator = EngineCoordinator.getInstance();
-
-    for (const ta of [...splAccounts.value, ...token2022Accounts.value]) {
-      const info = ta.account.data.parsed.info;
-      const mint = info.mint;
-      const amountUi = info.tokenAmount.uiAmount;
-      const rawStr = info.tokenAmount.amount;
-
-      if (!amountUi || BigInt(rawStr) <= 0n || mint === SOL_MINT) continue;
-
-      const sellRes = await JupiterService.executeRealSellSwap(
-        connection,
-        this.dedicatedKeypair,
-        mint,
-        0,
-        300,
-        100
-      );
-
-      if (sellRes.success && sellRes.txSignature) {
-        const solReceived = sellRes.inAmountSol || 0;
-        totalSolReclaimed += solReceived;
-        results.push({
-          mint,
-          amountUi,
-          solReceived,
-          txSignature: sellRes.txSignature,
-        });
-
-        // Close position in coordinator if present
-        const matchingPos = coordinator.activePositions.find((p) => p.tokenMint === mint);
-        if (matchingPos) {
-          matchingPos.status = 'CLOSED';
-          matchingPos.closedAt = Date.now();
-          matchingPos.exitReason = 'RECLAIM_ALL_SOL_MANUAL';
-          matchingPos.exitTxSignature = sellRes.txSignature;
-          matchingPos.exitSolscanUrl = `https://solscan.io/tx/${sellRes.txSignature}`;
-          matchingPos.realizedPnlSol = (matchingPos.realizedPnlSol || 0) + (solReceived - matchingPos.costBasisSol);
-          matchingPos.executionHistory.push({
-            action: 'SELL',
-            priceSol: amountUi > 0 ? solReceived / amountUi : matchingPos.currentPriceSol,
-            tokens: amountUi,
-            pnlSol: solReceived - matchingPos.costBasisSol,
-            timestamp: Date.now(),
-            txSignature: sellRes.txSignature,
-          });
-          coordinator.closedPositions.unshift(matchingPos);
-          coordinator.activePositions = coordinator.activePositions.filter((p) => p.id !== matchingPos.id);
-        }
-      } else {
-        results.push({
-          mint,
-          amountUi,
-          solReceived: 0,
-          error: sellRes.error,
-        });
-      }
-    }
-
-    // Refresh balance and recalculate portfolio
-    await this.refreshBalance();
-    coordinator.recalculatePortfolio();
-
-    return {
-      success: true,
-      swappedCount: results.filter((r) => r.solReceived > 0).length,
-      totalSolReclaimed,
-      results,
-    };
+    return { success: results.every(r => !r.error), swappedCount: results.filter(r => r.solReceived > 0).length,
+      totalSolReclaimed: results.reduce((n, r) => n + r.solReceived, 0), results };
   }
 
-  public async runDiagnostics(): Promise<WalletDiagnostics> {
+  public async runDiagnostics(): Promise<WalletDiagnostics & { pendingExecutions: ReturnType<typeof JupiterService.getPendingExecutions> }> {
     let rpcLatencyMs = 0;
     let rpcStatus: 'OPTIMAL' | 'DEGRADED' | 'DOWN' = 'OPTIMAL';
     let currentSlot = 0;
@@ -1094,9 +787,9 @@ export class WalletManager {
         rpcStatus = 'DEGRADED';
       }
     } catch {
-      rpcLatencyMs = 95;
-      rpcStatus = 'OPTIMAL';
-      currentSlot = 289456123;
+      rpcLatencyMs = 0;
+      rpcStatus = 'DOWN';
+      currentSlot = 0;
     }
 
     await this.refreshBalance();
@@ -1108,7 +801,9 @@ export class WalletManager {
     accountExists = Boolean(this.config.walletAddress && this.config.isConnected);
     rentExempt = balanceSol >= 0.002;
 
-    const checks: { name: string; status: 'PASS' | 'WARN' | 'FAIL'; message: string }[] = [];
+    const checks: { name: string; status: 'PASS' | 'WARN' | 'FAIL'; message: string }[] = [
+      { name: 'Live transaction instruction attestation', status: 'FAIL', message: 'Live signing blocked until instruction-level intent verification and durable accounting reconciliation are implemented.' },
+    ];
 
     if (rpcStatus === 'OPTIMAL') {
       checks.push({
@@ -1169,10 +864,11 @@ export class WalletManager {
     const passCount = checks.filter((c) => c.status === 'PASS').length;
     const warnCount = checks.filter((c) => c.status === 'WARN').length;
     const readinessScore = Math.round(passCount * 25 + warnCount * 10);
-    const canAutotrade = accountExists && !this.config.killSwitchActive && balanceSol >= gasReserve;
+    const canAutotrade = false; // Instruction-level transaction attestation is not implemented.
 
     return {
       timestamp: Date.now(),
+      pendingExecutions: this.getPendingExecutions(),
       rpcLatencyMs,
       rpcStatus,
       currentSlot,
@@ -1223,336 +919,13 @@ export class WalletManager {
    * Executes a real on-chain trade (LIVE) or simulated paper trade (PAPER).
    * ZERO silent fallbacks!
    */
-  public async executeSignalTrade(request: SignalTradeTriggerRequest): Promise<SignalTradeResult> {
-    const timestamp = Date.now();
-    const mode = this.config.autotradeMode;
-    const isLiveExecution = mode === 'FULL_AUTONOMOUS' || mode === 'SEMI_AUTONOMOUS';
-
-    // ----------------------------------------------------
-    // 1. LIVE TRADING EXECUTION PATH
-    // ----------------------------------------------------
-    if (isLiveExecution) {
-      // Gate 1: Preflight Diagnostic Check
-      if (!this.config.lastPreflightPassed) {
-        return {
-          success: false,
-          tokenMint: request.tokenMint,
-          symbol: request.symbol,
-          sizeSol: 0,
-          priceSol: 0,
-          slippagePct: 0,
-          priorityFeeSol: 0,
-          timestamp,
-          mode,
-          error: 'LIVE trading blocked: Live Preflight diagnostic must PASS before any live on-chain trade. Run Preflight in Step 2.',
-        };
-      }
-
-      // Gate 2: Dedicated Keypair Check
-      if (!this.dedicatedKeypair) {
-        return {
-          success: false,
-          tokenMint: request.tokenMint,
-          symbol: request.symbol,
-          sizeSol: 0,
-          priceSol: 0,
-          slippagePct: 0,
-          priorityFeeSol: 0,
-          timestamp,
-          mode,
-          error: 'LIVE trading blocked: No dedicated trading keypair loaded in secure worker. Setup keypair in Step 1.',
-        };
-      }
-
-      // Gate 3: Kill Switch Check
-      if (this.config.killSwitchActive) {
-        return {
-          success: false,
-          tokenMint: request.tokenMint,
-          symbol: request.symbol,
-          sizeSol: 0,
-          priceSol: 0,
-          slippagePct: 0,
-          priorityFeeSol: 0,
-          timestamp,
-          mode,
-          error: `LIVE trading blocked: Kill switch engaged: "${this.config.killSwitchTriggeredReason || 'Manual lock'}".`,
-        };
-      }
-
-      // Gate 4: On-Chain Balance Check
-      await this.refreshBalance();
-      const minNeeded = this.config.gasReserveSol + this.config.minTradeSizeSol;
-      if (this.config.balanceSol < minNeeded) {
-        return {
-          success: false,
-          tokenMint: request.tokenMint,
-          symbol: request.symbol,
-          sizeSol: 0,
-          priceSol: 0,
-          slippagePct: 0,
-          priorityFeeSol: 0,
-          timestamp,
-          mode,
-          error: `Insufficient on-chain balance (${this.config.balanceSol.toFixed(3)} SOL). Need at least ${minNeeded.toFixed(3)} SOL for trade + gas floor.`,
-        };
-      }
-
-      // Position sizing bounded by config
-      const targetSizeSol = request.recommendedSizeSol || this.config.targetTradeSizeSol || 0.02;
-      const sizeSol = Math.min(this.config.maxTradeSizeSol, Math.max(this.config.minTradeSizeSol, targetSizeSol));
-      const priceSol = request.priceSol || 0.00042;
-      const priceUsd = request.priceUsd || priceSol * SOL_USD_ESTIMATE;
-      let sizeTokens = Math.floor(sizeSol / priceSol);
-      let realizedEntryPriceSol = priceSol;
-
-      // Execute on Solana
-      const connection = new Connection(this.config.rpcEndpoint, 'confirmed');
-      let realTxSig = '';
-      let explorerUrl = '';
-
-      if (this.config.network === 'mainnet-beta') {
-        const sol_lamports = solToLamports(sizeSol);
-        const quoteRes = await JupiterService.fetchQuote({
-          inputMint: SOL_MINT,
-          outputMint: request.tokenMint,
-          amountLamports: sol_lamports,
-          slippageBps: Math.round(this.config.maxSlippagePct * 100),
-        });
-
-        if (!quoteRes.success || !quoteRes.data) {
-          return {
-            success: false,
-            tokenMint: request.tokenMint,
-            symbol: request.symbol,
-            sizeSol,
-            priceSol,
-            slippagePct: 0,
-            priorityFeeSol: 0,
-            timestamp,
-            mode,
-            error: `Jupiter swap route failed: ${quoteRes.error || 'No route found'}`,
-          };
-        }
-
-        // HARD SAFETY VALIDATION GATE BEFORE BUILDING/SIGNING
-        let token_decimals = 6;
-        try {
-          const valRes = await TradeSafetyValidator.validateQuote(connection, {
-            intended_action: 'BUY',
-            intended_token_mint: request.tokenMint,
-            intended_sol_lamports: sol_lamports,
-            quote_response: quoteRes.data,
-            wallet_pubkey: this.dedicatedKeypair.publicKey.toBase58(),
-            max_price_impact_pct: this.config.maxPriceImpactPct || 2.5,
-            max_slippage_bps: Math.round(this.config.maxSlippagePct * 100),
-          });
-          token_decimals = valRes.token_decimals;
-        } catch (valErr: any) {
-          console.error('[TradeSafety] BUY REJECTED:', valErr.message);
-          return {
-            success: false,
-            tokenMint: request.tokenMint,
-            symbol: request.symbol,
-            sizeSol,
-            priceSol,
-            slippagePct: 0,
-            priorityFeeSol: 0,
-            timestamp,
-            mode,
-            error: valErr.message || 'TRADE_REJECTED: SAFETY_VALIDATION_FAILED',
-          };
-        }
-
-        const buildRes = await JupiterService.buildSwapTransaction(
-          quoteRes.data,
-          this.dedicatedKeypair.publicKey.toBase58(),
-          150_000
-        );
-
-        if (!buildRes.success || !buildRes.versionedTx) {
-          return {
-            success: false,
-            tokenMint: request.tokenMint,
-            symbol: request.symbol,
-            sizeSol,
-            priceSol,
-            slippagePct: 0,
-            priorityFeeSol: 0,
-            timestamp,
-            mode,
-            error: `Failed to construct swap transaction: ${buildRes.error}`,
-          };
-        }
-
-        // TRANSACTION SIGNER VALIDATION BEFORE SIGNING
-        try {
-          TradeSafetyValidator.validateCompiledTransaction({
-            versioned_tx: buildRes.versionedTx,
-            wallet_pubkey: this.dedicatedKeypair.publicKey.toBase58(),
-            intended_action: 'BUY',
-            intended_token_mint: request.tokenMint,
-          });
-        } catch (txValErr: any) {
-          console.error('[TradeSafety] BUY TX REJECTED:', txValErr.message);
-          return {
-            success: false,
-            tokenMint: request.tokenMint,
-            symbol: request.symbol,
-            sizeSol,
-            priceSol,
-            slippagePct: 0,
-            priorityFeeSol: 0,
-            timestamp,
-            mode,
-            error: txValErr.message || 'TRADE_REJECTED: TRANSACTION_VALIDATION_FAILED',
-          };
-        }
-
-        const execRes = await JupiterService.signAndExecuteSwap(
-          connection,
-          buildRes.versionedTx,
-          this.dedicatedKeypair
-        );
-
-        if (!execRes.success || !execRes.txSignature) {
-          return {
-            success: false,
-            tokenMint: request.tokenMint,
-            symbol: request.symbol,
-            sizeSol,
-            priceSol,
-            slippagePct: 0,
-            priorityFeeSol: 0,
-            timestamp,
-            mode,
-            error: `On-chain swap execution failed: ${execRes.error}`,
-          };
-        }
-
-        realTxSig = execRes.txSignature;
-        explorerUrl = execRes.explorerUrl || `https://solscan.io/tx/${realTxSig}`;
-
-        // Accurate decimal-safe accounting from verified quote outAmount
-        const out_base_units = BigInt(quoteRes.data.outAmount);
-        const actual_tokens = toTokenHumanAmount(out_base_units, token_decimals);
-        if (actual_tokens > 0) {
-          sizeTokens = actual_tokens;
-          realizedEntryPriceSol = sizeSol / actual_tokens;
-        }
-      } else {
-        // Devnet live micro-trade
-        const execRes = await JupiterService.executeDevnetRealMicroTrade(
-          connection,
-          this.dedicatedKeypair,
-          `TokenTaker:Buy:${request.symbol}`
-        );
-
-        if (!execRes.success || !execRes.txSignature) {
-          return {
-            success: false,
-            tokenMint: request.tokenMint,
-            symbol: request.symbol,
-            sizeSol,
-            priceSol,
-            slippagePct: 0,
-            priorityFeeSol: 0,
-            timestamp,
-            mode,
-            error: `Devnet live execution failed: ${execRes.error}`,
-          };
-        }
-
-        realTxSig = execRes.txSignature;
-        explorerUrl = execRes.explorerUrl || `https://solscan.io/tx/${realTxSig}?cluster=devnet`;
-      }
-
-      // Record in coordinator
-      const coordinator = EngineCoordinator.getInstance();
-      const posId = `POS_LIVE_${request.symbol}_${Date.now()}`;
-      const ladder = ExitEngine.createLadder(priceSol);
-
-      const livePosition: Position = {
-        id: posId,
-        tokenMint: request.tokenMint,
-        symbol: request.symbol,
-        name: request.name || request.symbol,
-        entryPriceSol: realizedEntryPriceSol,
-        entryPriceUsd: realizedEntryPriceSol * SOL_USD_ESTIMATE,
-        currentPriceSol: realizedEntryPriceSol,
-        currentPriceUsd: realizedEntryPriceSol * SOL_USD_ESTIMATE,
-        peakPriceUsd: priceUsd,
-        lowestPriceUsd: priceUsd,
-        sizeTokens,
-        costBasisSol: sizeSol,
-        currentValueSol: sizeSol,
-        unrealizedPnlSol: 0,
-        unrealizedPnlPct: 0,
-        realizedPnlSol: 0,
-        enteredAt: timestamp,
-        holdingSec: 0,
-        stopLossPriceSol: priceSol * (1 + this.config.defaultStopLossPct / 100),
-        takeProfitLadder: [
-          { targetPriceSol: priceSol * (1 + this.config.takeProfitTier1Pct / 100), pctToSell: 50, filled: false },
-          { targetPriceSol: priceSol * (1 + this.config.takeProfitTier2Pct / 100), pctToSell: 50, filled: false },
-        ],
-        trailingStopPriceSol: ladder.trailingStopPriceSol,
-        trailingActivated: false,
-        status: 'OPEN',
-        isRealWalletTrade: true,
-        executionType: 'LIVE_ON_CHAIN',
-        isSimulated: false,
-        walletAddress: this.dedicatedKeypair.publicKey.toBase58(),
-        executionVenue: this.config.network === 'devnet' ? 'Solana Devnet' : 'Jupiter DEX / Solana Mainnet',
-        executionHistory: [
-          {
-            action: 'ENTRY',
-            priceSol,
-            tokens: sizeTokens,
-            pnlSol: 0,
-            timestamp,
-            txSignature: realTxSig,
-          },
-        ],
-      };
-
-      coordinator.activePositions.unshift(livePosition);
-      await this.refreshBalance();
-
-      return {
-        success: true,
-        txSignature: realTxSig,
-        explorerUrl,
-        positionId: posId,
-        tokenMint: request.tokenMint,
-        symbol: request.symbol,
-        sizeSol,
-        priceSol,
-        slippagePct: this.config.maxSlippagePct,
-        priorityFeeSol: 0.00015,
-        timestamp,
-        mode,
-        executionType: 'LIVE_ON_CHAIN',
-        isSimulated: false,
-      };
-    }
-
-    // ----------------------------------------------------
-    // 2. RETIRED SIMULATION PATH
-    // ----------------------------------------------------
-    // Paper simulations have been completely retired per architecture mandate.
-    return {
-      success: false,
-      tokenMint: request.tokenMint,
-      symbol: request.symbol,
-      sizeSol: 0,
-      priceSol: 0,
-      slippagePct: 0,
-      priorityFeeSol: 0,
-      timestamp,
-      mode,
-      error: 'Autotrade mode is OFF. Enable Full Autonomous or Semi-Autonomous mode in Step 3 or click 1-Click Real Buy.',
-    };
+  public async executeSignalTrade(request: SignalTradeTriggerRequest, signalGuard?: { validate: () => void; maxEntryPriceSol: number }): Promise<SignalTradeResult> {
+    const result = await this.oneClickEnroll({ tokenMint: request.tokenMint, symbol: request.symbol, name: request.name,
+      sizeSol: request.recommendedSizeSol ?? this.config.targetTradeSizeSol,
+      priceSol: request.priceSol, priceUsd: request.priceUsd }, signalGuard);
+    return { ...result, priceSol: result.priceSol ?? 0, slippagePct: this.config.maxSlippagePct,
+      priorityFeeSol: 0, mode: this.config.autotradeMode,
+      executionType: result.success ? 'LIVE_ON_CHAIN' : undefined, isSimulated: false };
   }
 
   /**
@@ -1585,15 +958,14 @@ export class WalletManager {
     );
     const exposureSol = livePositions.reduce((sum, p) => sum + p.costBasisSol, 0);
     const unrealizedPnlSol = livePositions.reduce((sum, p) => sum + p.unrealizedPnlSol, 0);
-    const closedLive = coordinator.closedPositions.filter((p) => p.isRealWalletTrade);
-    const dailyRealizedPnlSol = closedLive.reduce((sum, p) => sum + (p.realizedPnlSol || 0), 0);
+    const dailyRealizedPnlSol = coordinator.portfolio.dailyRealizedPnlSol;
 
     return {
       onChainSolBalance: this.config.balanceSol,
       allocatedCapitalSol: this.config.allocatedCapitalSol,
       activeLiveExposureSol: Number(exposureSol.toFixed(4)),
       dailyRealizedPnlSol: Number(dailyRealizedPnlSol.toFixed(4)),
-      totalRealizedPnlSol: Number(dailyRealizedPnlSol.toFixed(4)),
+      totalRealizedPnlSol: Number(coordinator.portfolio.totalRealizedPnlSol.toFixed(4)),
       unrealizedPnlSol: Number(unrealizedPnlSol.toFixed(4)),
       openPositionsCount: livePositions.length,
       lastOnChainSync: this.lastBalanceCheck,

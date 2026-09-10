@@ -2,6 +2,7 @@
  * Production-Grade Autonomous Solana Memecoin Trading System
  * Express Server & Vite Middleware Integration
  */
+import 'dotenv/config';
 import express from 'express';
 import path from 'path';
 import { createServer as createViteServer } from 'vite';
@@ -72,6 +73,7 @@ app.get('/api/state', (req, res) => {
     weights: coordinator.weights,
     activePositions: coordinator.activePositions,
     closedPositions: coordinator.closedPositions,
+    feedStatus: coordinator.getFeedStatus(),
     candidateTokens: coordinator.candidateTokens,
     tradeHistory: coordinator.tradeHistory,
     walletConfig: walletManager.getConfig(),
@@ -104,19 +106,22 @@ app.post('/api/mode', (req, res) => {
   }
 
   const result = coordinator.setMode(mode);
-  res.json(result);
+  res.status(result.success ? 200 : 403).json(result);
 });
 
 /**
  * Emergency Kill Switch Trigger
  */
-app.post('/api/emergency-stop', (req, res) => {
+app.post('/api/emergency-stop', async (req, res) => {
   const reason = req.body.reason || 'Operator triggered manual kill switch from dashboard';
-  coordinator.triggerEmergencyStop(reason);
-  res.json({
-    success: true,
-    message: 'EMERGENCY KILL SWITCH ACTIVATED. All positions closed. Circuit breaker locked.',
-  });
+  try {
+    await coordinator.triggerEmergencyStop(reason);
+    const remaining = coordinator.activePositions.filter(p => p.isRealWalletTrade).length;
+    res.json({ success: true, remainingPositions: remaining,
+      message: remaining ? 'New entries halted. Some exits failed or await reconciliation; positions remain monitored.' : 'New entries halted. No tracked live positions remain.' });
+  } catch {
+    res.status(503).json({ success: false, message: 'Entries halted; exit settlement could not be completed. Check open positions.' });
+  }
 });
 
 /**
@@ -327,13 +332,8 @@ app.post('/api/grok-bot/trigger', (req, res) => {
 /**
  * Trigger simulated incoming launch in main coordinator (paper trading)
  */
-app.post('/api/paper/trigger-launch', (req, res) => {
-  try {
-    (coordinator as any).simulateIncomingLaunch();
-    res.json({ success: true, message: 'Simulated launch ingested into coordinator' });
-  } catch (err: any) {
-    res.status(500).json({ error: err.message || 'Failed to trigger launch' });
-  }
+app.post('/api/paper/trigger-launch', (_req, res) => {
+  res.status(410).json({ error: 'Synthetic launch ingestion retired. Scanner accepts provider launch events only.' });
 });
 
 /**
@@ -397,10 +397,10 @@ app.post('/api/wallet/config', (req, res) => {
   }
 });
 
-app.post('/api/wallet/kill-switch', (req, res) => {
+app.post('/api/wallet/kill-switch', async (req, res) => {
   try {
     const { reason } = req.body;
-    const result = walletManager.triggerKillSwitch(reason || 'Operator triggered Emergency Kill Switch');
+    const result = await walletManager.triggerKillSwitch(reason || 'Operator triggered Emergency Kill Switch');
     res.json(result);
   } catch (err: any) {
     res.status(500).json({ error: err.message });
@@ -409,7 +409,13 @@ app.post('/api/wallet/kill-switch', (req, res) => {
 
 app.post('/api/wallet/reset-kill-switch', (req, res) => {
   try {
+    if (walletManager.getPendingExecutions().length) return res.status(409).json({ error: 'Reconcile unresolved executions before resetting the kill switch' });
     const result = walletManager.resetKillSwitch();
+    coordinator.riskLimits.circuitBreakerActive = false;
+    coordinator.riskLimits.circuitBreakerReason = undefined;
+    coordinator.recalculatePortfolio();
+    coordinator.setMode(SystemMode.SHADOW);
+    coordinator.persistState();
     res.json(result);
   } catch (err: any) {
     res.status(500).json({ error: err.message });
@@ -559,9 +565,9 @@ app.post('/api/wallet/devnet-airdrop', async (req, res) => {
 /**
  * Flatten / Liquidate ALL active real wallet trades
  */
-app.post('/api/wallet/flatten-all-real', (req, res) => {
+app.post('/api/wallet/flatten-all-real', async (req, res) => {
   try {
-    const result = walletManager.flattenAllRealTrades();
+    const result = await walletManager.flattenAllRealTrades();
     res.json(result);
   } catch (err: any) {
     res.status(500).json({ error: err.message });

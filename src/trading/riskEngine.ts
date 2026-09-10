@@ -1,8 +1,5 @@
-/**
- * Risk Engine & Adaptive Position Sizing
- * Enforces hard mathematical limits and capital preservation.
- */
 import { OpportunityScoreOutput, PortfolioState, RiskLimits, TokenSafetyReport } from '../types.ts';
+import { solToLamports, lamportsToSol } from './decimalSafeUtils.ts';
 
 export interface SizingInput {
   portfolio: PortfolioState;
@@ -23,7 +20,7 @@ export interface RiskEvaluationResult {
   rejectReasons: string[];
   recommendedSizeSol: number;
   maxAllowableLossSol: number;
-  stopLossPriceMultiplier: number; // e.g. 0.85 = -15% stop
+  stopLossPriceMultiplier: number;
   adaptiveMultiplier: number;
   calibratedWinProb?: number;
   calibratedPayoffRatio?: number;
@@ -31,163 +28,48 @@ export interface RiskEvaluationResult {
 }
 
 export class RiskEngine {
-  /**
-   * Absolute gatekeeper for trade authorization and empirically calibrated sizing
-   */
   public static evaluateAndSize(input: SizingInput): RiskEvaluationResult {
-    const { portfolio, opportunity, safety, liquiditySol, openPositionsCount, riskLimits, exitabilityScore = 80 } = input;
-    const rejectReasons: string[] = [];
-
-    const gasReserve = input.gasReserveSol !== undefined ? input.gasReserveSol : 0.025;
-    const minTradeSize = input.minTradeSizeSol !== undefined ? input.minTradeSizeSol : 0.01;
-    const availableCashForTrades = Math.max(0, portfolio.cashSol - gasReserve);
-
-    // 1. Circuit Breaker Checks
-    if (riskLimits.circuitBreakerActive) {
-      rejectReasons.push('CIRCUIT BREAKER: Trading halted due to manual or risk trigger');
+    const { portfolio: p, opportunity: o, riskLimits: r } = input;
+    const reserve = input.gasReserveSol ?? 0.025;
+    const minimum = input.minTradeSizeSol ?? 0.01;
+    const target = input.targetTradeSizeSol ?? 0.02;
+    const exitability = input.exitabilityScore ?? 80;
+    const reasons: string[] = [];
+    const values = [p.cashSol, p.equitySol, p.dailyRealizedPnlSol, p.consecutiveLosses,
+      input.liquiditySol, input.openPositionsCount, input.currentExposureSol, o.expectedSlippagePct,
+      r.maxPositionPercent, r.maxTokenExposurePercent, r.maxTradeLossSol, r.maxDailyLossSol,
+      r.maxOpenPositions, r.maxConsecutiveLosses, r.maxSlippagePercent, reserve, minimum, target, exitability];
+    if (values.some(v => !Number.isFinite(v)) || values.some((v, i) => i !== 2 && v < 0) ||
+        minimum <= 0 || target <= 0 || r.maxPositionPercent > 1 || r.maxTokenExposurePercent > 1) {
+      reasons.push('INVALID RISK INPUT: finite, nonnegative values and fractional exposure limits required');
     }
+    if (r.circuitBreakerActive) reasons.push('CIRCUIT BREAKER: Trading halted');
+    if (p.consecutiveLosses >= r.maxConsecutiveLosses) reasons.push('CONSECUTIVE LOSS LIMIT');
+    if (p.dailyRealizedPnlSol <= -r.maxDailyLossSol) reasons.push('DAILY LOSS LIMIT');
+    if (input.openPositionsCount >= r.maxOpenPositions) reasons.push('CONCURRENCY LIMIT');
+    if (o.expectedSlippagePct > r.maxSlippagePercent) reasons.push('EXCESSIVE SLIPPAGE');
+    if (exitability < 50) reasons.push('ILLIQUID EXITABILITY');
 
-    if (portfolio.consecutiveLosses >= riskLimits.maxConsecutiveLosses) {
-      rejectReasons.push(`CIRCUIT BREAKER: ${portfolio.consecutiveLosses} consecutive losses reached (limit: ${riskLimits.maxConsecutiveLosses})`);
-    }
-
-    if (portfolio.dailyRealizedPnlSol <= -riskLimits.maxDailyLossSol) {
-      rejectReasons.push(`DAILY LOSS LIMIT: Accumulated daily loss (-${Math.abs(portfolio.dailyRealizedPnlSol).toFixed(2)} SOL) exceeds max daily loss (-${riskLimits.maxDailyLossSol} SOL)`);
-    }
-
-    // 2. Open Position Limits
-    if (openPositionsCount >= riskLimits.maxOpenPositions) {
-      rejectReasons.push(`CONCURRENCY LIMIT: Max open positions (${riskLimits.maxOpenPositions}) already active`);
-    }
-
-    // 3. Cash Availability
-    if (portfolio.cashSol <= gasReserve || availableCashForTrades < minTradeSize) {
-      rejectReasons.push(`INSUFFICIENT CAPITAL: Available cash (${portfolio.cashSol.toFixed(4)} SOL) minus reserve (${gasReserve} SOL) is below minimum trade size (${minTradeSize} SOL)`);
-    }
-
-    // 4. Slippage and Execution Limits
-    if (opportunity.expectedSlippagePct > riskLimits.maxSlippagePercent) {
-      rejectReasons.push(`EXCESSIVE SLIPPAGE: Expected slippage (${opportunity.expectedSlippagePct}%) exceeds safety ceiling (${riskLimits.maxSlippagePercent}%)`);
-    }
-
-    // 5. Exitability Check (Separated from Safety)
-    if (exitabilityScore < 50) {
-      rejectReasons.push(`ILLIQUID EXITABILITY: Exitability score (${exitabilityScore}/100) below minimum threshold (50/100)`);
-    }
-
-    // 6. Empirical Probability Calibration (replaces uncalibrated heuristics)
-    // Calibrated against historical empirical reliable bins
-    const score = opportunity.opportunityScore;
-    let p = 0.40; // calibrated win probability
-    let b = 1.20; // calibrated payoff ratio (mean win / mean loss)
-
-    if (score >= 85) {
-      p = 0.71;
-      b = 2.15;
-    } else if (score >= 75) {
-      p = 0.63;
-      b = 1.90;
-    } else if (score >= 60) {
-      p = 0.52;
-      b = 1.55;
-    } else {
-      p = 0.36;
-      b = 1.05;
-    }
-
-    // Mathematical Expectancy hurdle: E = p*b - (1-p)
-    const empiricalExpectancy = (p * b) - (1 - p);
-    if (empiricalExpectancy <= 0) {
-      rejectReasons.push(`NEGATIVE MATHEMATICAL EXPECTANCY: Calibrated edge (p=${p}, b=${b.toFixed(2)}, E=${empiricalExpectancy.toFixed(2)}) is non-positive`);
-    }
-
-    // 7. Adaptive Multiplier (OOS evidence shows conservative scaling)
-    let adaptiveMultiplier = 1.0;
-    if (portfolio.consecutiveLosses > 0) {
-      // Conservative downscaling during hostile regimes to preserve capital
-      adaptiveMultiplier = Math.max(0.4, 1.0 - (portfolio.consecutiveLosses * 0.25));
-    } else if (portfolio.rollingWinRate > 0.65 && portfolio.profitFactor > 1.8 && portfolio.currentDrawdownPct < 5.0) {
-      adaptiveMultiplier = Math.min(1.20, 1.0 + ((portfolio.rollingWinRate - 0.65) * 0.6));
-    }
-
-    // If failing any gate, reject immediately
-    if (rejectReasons.length > 0) {
-      return {
-        approved: false,
-        rejectReasons,
-        recommendedSizeSol: 0,
-        maxAllowableLossSol: 0,
-        stopLossPriceMultiplier: 0.85,
-        adaptiveMultiplier,
-        calibratedWinProb: p,
-        calibratedPayoffRatio: b,
-        calibratedKellyPct: 0,
-      };
-    }
-
-    // 8. Continuous Kelly Calculation with Fractional Dampening
-    // f* = (p*b - q) / b
-    const continuousKelly = Math.max(0, empiricalExpectancy / b);
-    // Apply conservative quarter-Kelly (0.20x - 0.25x)
-    const safeKellyFraction = continuousKelly * 0.22;
-
-    // Modulate by independent exitability score (discount if pool is shallow)
-    const exitabilityDiscount = Math.min(1.0, Math.max(0.4, exitabilityScore / 100));
-
-    // Base position size from equity and user config
-    const targetConfigSize = input.targetTradeSizeSol !== undefined ? input.targetTradeSizeSol : 0.02;
-    let targetSizeSol = Math.max(
-      minTradeSize,
-      Math.min(
-        availableCashForTrades,
-        targetConfigSize > 0 ? targetConfigSize : portfolio.equitySol * safeKellyFraction * adaptiveMultiplier * exitabilityDiscount
-      )
+    // Configured sizing only. Synthetic score bins are not empirical Kelly estimates.
+    const adaptiveMultiplier = Math.max(0.4, 1 - p.consecutiveLosses * 0.25);
+    const cap = Math.min(
+      target * adaptiveMultiplier,
+      p.cashSol - reserve,
+      p.equitySol * r.maxPositionPercent,
+      p.equitySol * r.maxTokenExposurePercent - input.currentExposureSol,
+      input.liquiditySol * 0.02,
+      r.maxTradeLossSol / 0.15,
+      Math.max(0, r.maxDailyLossSol + Math.min(0, p.dailyRealizedPnlSol)) / 0.15,
     );
-
-    // If equity-based sizing was used and equity is high, clamp by max allowable position percent
-    if (portfolio.equitySol > 1.0) {
-      const maxAllocSol = portfolio.equitySol * riskLimits.maxPositionPercent;
-      targetSizeSol = Math.min(targetSizeSol, maxAllocSol);
-    }
-
-    // Clamp by pool liquidity (never exceed 2.0% of pool liquidity to prevent severe price impact)
-    const maxPoolImpactSize = liquiditySol * 0.02;
-    targetSizeSol = Math.min(targetSizeSol, Math.max(minTradeSize, maxPoolImpactSize));
-
-    // Clamp by single trade loss limit (assuming -15% stop loss)
-    const stopLossMultiplier = 0.85; // -15% stop loss
-    const tradeRiskPct = 1 - stopLossMultiplier;
-    const maxByLossLimit = riskLimits.maxTradeLossSol / tradeRiskPct;
-    targetSizeSol = Math.min(targetSizeSol, maxByLossLimit);
-
-    // Ensure we don't exceed available cash after reserve
-    targetSizeSol = Math.min(targetSizeSol, availableCashForTrades);
-
-    // Floor check: Minimum viable trade size
-    if (targetSizeSol < minTradeSize) {
-      return {
-        approved: false,
-        rejectReasons: [`SIZING FLOOR: Computed position size (${targetSizeSol.toFixed(4)} SOL) is below minimum threshold (${minTradeSize} SOL)`],
-        recommendedSizeSol: 0,
-        maxAllowableLossSol: 0,
-        stopLossPriceMultiplier: 0.85,
-        adaptiveMultiplier,
-        calibratedWinProb: p,
-        calibratedPayoffRatio: b,
-        calibratedKellyPct: Number((safeKellyFraction * 100).toFixed(1)),
-      };
-    }
-
+    const size = Number.isFinite(cap) && cap > 0 ? lamportsToSol(solToLamports(cap)) : 0;
+    if (size < minimum || size <= 0) reasons.push('SIZING FLOOR: minimum exceeds a hard capital, exposure, liquidity or loss cap');
     return {
-      approved: true,
-      rejectReasons: [],
-      recommendedSizeSol: Number(targetSizeSol.toFixed(3)),
-      maxAllowableLossSol: Number((targetSizeSol * tradeRiskPct).toFixed(3)),
-      stopLossPriceMultiplier: stopLossMultiplier,
-      adaptiveMultiplier,
-      calibratedWinProb: p,
-      calibratedPayoffRatio: b,
-      calibratedKellyPct: Number((safeKellyFraction * 100).toFixed(1)),
+      approved: reasons.length === 0,
+      rejectReasons: reasons,
+      recommendedSizeSol: reasons.length ? 0 : size,
+      maxAllowableLossSol: reasons.length ? 0 : size * 0.15,
+      stopLossPriceMultiplier: 0.85,
+      adaptiveMultiplier: Number.isFinite(adaptiveMultiplier) ? adaptiveMultiplier : 0.4,
     };
   }
 }

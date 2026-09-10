@@ -45,25 +45,25 @@ import { DEFAULT_RISK_LIMITS, DEFAULT_STRATEGY_WEIGHTS, DEFAULT_SYSTEM_CONFIG } 
 type ActiveTab = 'GROK_BOT' | 'REAL_WALLET' | 'MONITOR' | 'ALPHA_AUDIT' | 'BACKTEST' | 'RISK_TUNING' | 'AUDIT_LOG';
 
 export const App: React.FC = () => {
-  const [activeTab, setActiveTab] = useState<ActiveTab>('GROK_BOT');
+  const [activeTab, setActiveTab] = useState<ActiveTab>('MONITOR');
 
   // Core State
   const [config, setConfig] = useState<SystemConfig>(DEFAULT_SYSTEM_CONFIG);
   const [portfolio, setPortfolio] = useState<PortfolioState>({
-    cashSol: 25.0,
-    equitySol: 25.0,
+    cashSol: 0,
+    equitySol: 0,
     activeExposureSol: 0,
     dailyRealizedPnlSol: 0,
     totalRealizedPnlSol: 0,
     unrealizedPnlSol: 0,
-    peakEquitySol: 25.0,
+    peakEquitySol: 0,
     currentDrawdownPct: 0,
     maxDrawdownPct: 0,
     consecutiveLosses: 0,
-    rollingWinRate: 0.62,
-    rollingExpectancySol: 0.28,
-    profitFactor: 2.15,
-    tradeCount: 24,
+    rollingWinRate: 0,
+    rollingExpectancySol: 0,
+    profitFactor: 0,
+    tradeCount: 0,
     adaptiveMultiplier: 1.0,
   });
   const [riskLimits, setRiskLimits] = useState<RiskLimits>(DEFAULT_RISK_LIMITS);
@@ -71,6 +71,7 @@ export const App: React.FC = () => {
   const [activePositions, setActivePositions] = useState<Position[]>([]);
   const [closedPositions, setClosedPositions] = useState<Position[]>([]);
   const [candidates, setCandidates] = useState<CandidateTokenState[]>([]);
+  const [feedStatus, setFeedStatus] = useState<{ state: string; tradeFlowEnabled: boolean; error?: string; trackedTokens: number }>();
   const [tradeHistory, setTradeHistory] = useState<TradeDecisionRecord[]>([]);
 
   // Selected candidate for detailed inspection / modal
@@ -100,18 +101,18 @@ export const App: React.FC = () => {
       if (data.weights) setWeights(data.weights);
       if (data.activePositions) setActivePositions(data.activePositions);
       if (data.closedPositions) setClosedPositions(data.closedPositions);
+      if (data.feedStatus) setFeedStatus(data.feedStatus);
       if (data.candidateTokens) {
         setCandidates(data.candidateTokens);
-        if (!selectedMicroCandidate && data.candidateTokens.length > 0) {
-          setSelectedMicroCandidate(data.candidateTokens[0]);
-        }
+        setSelectedMicroCandidate(previous => data.candidateTokens.find((c: CandidateTokenState) => c.metadata.mint === previous?.metadata.mint) ?? data.candidateTokens[0] ?? null);
+        setInspectedCandidate(previous => previous ? data.candidateTokens.find((c: CandidateTokenState) => c.metadata.mint === previous.metadata.mint) ?? null : null);
       }
       if (data.tradeHistory) setTradeHistory(data.tradeHistory);
       if (data.walletConfig) setWalletConfig(data.walletConfig);
     } catch (err) {
       console.warn('Telemetry polling notice:', err);
     }
-  }, [selectedMicroCandidate]);
+  }, []);
 
   useEffect(() => {
     fetchState();
@@ -460,9 +461,9 @@ export const App: React.FC = () => {
             }`}
           >
             <Flame className="w-3.5 h-3.5 text-amber-400 animate-pulse" />
-            <span>Grok Bot ($41 &rarr; $3.1k Flipper)</span>
+            <span>Grok Bot (Synthetic Demo)</span>
             <span className="px-1.5 py-0.5 rounded text-[9px] font-mono font-bold bg-amber-500/20 text-amber-300 border border-amber-500/40">
-              Autopilot
+              Simulation
             </span>
           </button>
 
@@ -509,7 +510,7 @@ export const App: React.FC = () => {
             <ShieldCheck className="w-3.5 h-3.5 text-emerald-400" />
             <span>Alpha Validation Audit</span>
             <span className="px-1.5 py-0.5 rounded text-[9px] font-mono font-bold bg-emerald-950 text-emerald-300 border border-emerald-800">
-              OOS Proof
+              Synthetic
             </span>
           </button>
 
@@ -522,7 +523,7 @@ export const App: React.FC = () => {
             }`}
           >
             <BarChart2 className="w-3.5 h-3.5" />
-            <span>Backtest &amp; Walk-Forward</span>
+            <span>Backtest (Synthetic Demo)</span>
           </button>
 
           <button
@@ -552,6 +553,11 @@ export const App: React.FC = () => {
 
         {/* Tab Views */}
         <div className="flex-1 flex flex-col">
+          {['GROK_BOT', 'BACKTEST', 'ALPHA_AUDIT', 'RISK_TUNING'].includes(activeTab) && (
+            <div className="mb-4 p-3 border border-amber-500/40 bg-amber-950/30 text-amber-200 text-sm">
+              Research/demo only. Synthetic histories and heuristic models are not real performance, calibrated probabilities, or evidence of profitability. Live entries use the separate observed-launch confirmation gate.
+            </div>
+          )}
           {activeTab === 'GROK_BOT' && <GrokBotStudio />}
 
           {activeTab === 'REAL_WALLET' && <WalletAutotradeStudio />}
@@ -579,6 +585,7 @@ export const App: React.FC = () => {
                     onNewRealTrade={() => handleOpenRealTradeModal()}
                   />
                   <LiveScanner
+                    feedStatus={feedStatus}
                     candidates={candidates}
                     onSelectCandidate={(cand) => {
                       setInspectedCandidate(cand);

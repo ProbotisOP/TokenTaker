@@ -14,14 +14,7 @@ export const SOL_DECIMALS = 9;
  * 1 SOL = 1,000,000,000 lamports.
  */
 export function solToLamports(sol_human: number): bigint {
-  if (typeof sol_human !== 'number' || isNaN(sol_human) || sol_human < 0) {
-    throw new Error(`Invalid sol_human amount: ${sol_human}`);
-  }
-  // Avoid floating point multiplication imprecision by splitting integer & fractional parts
-  const fixed = sol_human.toFixed(9);
-  const [intPart, decPart = ''] = fixed.split('.');
-  const paddedDec = (decPart + '000000000').slice(0, 9);
-  return BigInt(intPart) * 1_000_000_000n + BigInt(paddedDec);
+  return toTokenBaseUnits(sol_human, SOL_DECIMALS);
 }
 
 /**
@@ -36,19 +29,18 @@ export function lamportsToSol(sol_lamports: bigint | number | string): number {
  * Converts a human-readable token quantity into integer base units using verified decimals.
  */
 export function toTokenBaseUnits(token_human: number, token_decimals: number): bigint {
-  if (typeof token_human !== 'number' || isNaN(token_human) || token_human < 0) {
+  if (!Number.isFinite(token_human) || token_human < 0) {
     throw new Error(`Invalid token_human amount: ${token_human}`);
   }
   if (!Number.isInteger(token_decimals) || token_decimals < 0 || token_decimals > 18) {
     throw new Error(`Invalid token_decimals: ${token_decimals}`);
   }
-
-  const fixed = token_human.toFixed(token_decimals);
-  const [intPart, decPart = ''] = fixed.split('.');
-  const paddedDec = (decPart + '0'.repeat(token_decimals)).slice(0, token_decimals);
-  const multiplier = 10n ** BigInt(token_decimals);
-
-  return BigInt(intPart) * multiplier + (token_decimals > 0 ? BigInt(paddedDec) : 0n);
+  // Parse decimal notation, including exponents, without rounding up spend limits.
+  const [coefficient, exponent = '0'] = token_human.toString().split('e');
+  const [whole, fraction = ''] = coefficient.split('.');
+  const digits = BigInt(whole + fraction);
+  const shift = token_decimals + Number(exponent) - fraction.length;
+  return shift >= 0 ? digits * 10n ** BigInt(shift) : digits / 10n ** BigInt(-shift);
 }
 
 /**
@@ -85,13 +77,16 @@ export async function getOnChainTokenDecimals(
   try {
     const supplyRes = await connection.getTokenSupply(mintPubkey);
     if (supplyRes?.value?.decimals !== undefined) {
-      return supplyRes.value.decimals;
+      const decimals = supplyRes.value.decimals;
+      if (!Number.isInteger(decimals) || decimals < 0 || decimals > 18) throw new Error('Invalid mint decimals');
+      return decimals;
     }
   } catch (err) {
     // Fallback: query account info directly
     const accInfo = await connection.getParsedAccountInfo(mintPubkey);
     const parsedData = (accInfo?.value?.data as any)?.parsed?.info;
     if (parsedData?.decimals !== undefined) {
+      if (!Number.isInteger(parsedData.decimals) || parsedData.decimals < 0 || parsedData.decimals > 18) throw new Error('Invalid mint decimals');
       return parsedData.decimals;
     }
   }
@@ -119,10 +114,10 @@ export async function getOnChainTokenBalance(
   const [splAccounts, token2022Accounts] = await Promise.all([
     connection.getParsedTokenAccountsByOwner(walletPubkey, {
       programId: new PublicKey('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA'),
-    }).catch(() => ({ value: [] })),
+    }),
     connection.getParsedTokenAccountsByOwner(walletPubkey, {
       programId: new PublicKey('TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb'),
-    }).catch(() => ({ value: [] })),
+    }),
   ]);
 
   let total_base_units = 0n;
@@ -152,11 +147,7 @@ export async function getOnChainTokenBalance(
 
   // If no token account exists yet, query the mint directly to know its decimals
   if (program === 'none') {
-    try {
-      decimals = await getOnChainTokenDecimals(connection, mintPubkey);
-    } catch {
-      decimals = 6; // fallback only for uninitialized metadata queries
-    }
+    decimals = await getOnChainTokenDecimals(connection, mintPubkey);
   }
 
   const ui_amount = toTokenHumanAmount(total_base_units, decimals);

@@ -121,7 +121,7 @@ async function runAuditSuite() {
     outputMint: TOKEN_6_DEC,
     inAmount: '20000000', // 0.02 SOL
     outAmount: '1132426631', // 1,132.42 tokens
-    otherAmountThreshold: '1100000000',
+    otherAmountThreshold: '1110000000',
     priceImpactPct: '0.05',
     routePlan: [{ swapInfo: { label: 'Raydium CPMM' } }],
   };
@@ -308,13 +308,13 @@ async function runAuditSuite() {
   // GROUP 7: Compiled Transaction Signer Validation
   // -------------------------------------------------------------
   console.log('\n--- Group 7: Transaction Signer Validation ---');
-  const validKeypair = Keypair.generate();
-  const unauthorizedKeypair = Keypair.generate();
+  const validKeypair = { publicKey: new PublicKey(TEST_WALLET) };
+  const unauthorizedKeypair = { publicKey: new PublicKey(TOKEN_9_DEC) };
 
   // Create a minimal VersionedTransaction with validKeypair as signer
   const mockTx = {
     message: {
-      staticAccountKeys: [validKeypair.publicKey, Keypair.generate().publicKey],
+      staticAccountKeys: [validKeypair.publicKey, new PublicKey(TOKEN_6_DEC)],
       header: {
         numRequiredSignatures: 1,
       },
@@ -329,11 +329,11 @@ async function runAuditSuite() {
       intended_action: 'BUY',
       intended_token_mint: TOKEN_6_DEC,
     });
-    signerPass = true;
-  } catch (err) {
     signerPass = false;
+  } catch (err: any) {
+    signerPass = err.message.includes('SWAP_INSTRUCTIONS_NOT_ATTESTED');
   }
-  assert(signerPass, 'Valid transaction signer passes validation');
+  assert(signerPass, 'Matching signer alone is insufficient: unverified payload is blocked');
 
   let signerFail = false;
   try {

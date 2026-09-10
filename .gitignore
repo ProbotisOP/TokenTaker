@@ -7,3 +7,7 @@ coverage/
 .env*
 !.env.example
 .secure_trading_keypair.json
+.execution-pending.json
+.execution-pending.json.tmp
+.trading-state.json
+.trading-state.json.tmp
