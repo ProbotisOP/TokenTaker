@@ -110,6 +110,11 @@ export class EngineCoordinator {
   stop(): void { clearInterval(this.loop); clearInterval(this.pricePoll); this.feed.stop(); }
   getFeedStatus() { return this.feed.getStatus(); }
 
+  hasSettledSignature(signature: string): boolean {
+    return this.settledSignatures.has(signature) || [...this.activePositions, ...this.closedPositions].some(position =>
+      position.txSignature === signature || position.exitTxSignature === signature || position.executionHistory.some(entry => entry.txSignature === signature));
+  }
+
   persistSettlement(signature: string): void {
     if (!this.stateStore) throw new Error('Durable accounting unavailable; settlement requires reconciliation');
     this.settledSignatures.add(signature);
@@ -127,7 +132,21 @@ export class EngineCoordinator {
     this.riskLimits.circuitBreakerReason = reason;
     this.persistState();
     const wm = WalletManager.getInstance();
-    await wm.triggerKillSwitch(reason);
+    if (!this.activePositions.some(p => p.signingMethod === 'PHANTOM')) {
+      await wm.triggerKillSwitch(reason);
+      return;
+    }
+    wm.updateConfig({ killSwitchActive: true, killSwitchTriggeredReason: reason,
+      killSwitchTriggeredAt: Date.now(), autotradeMode: 'OFF' });
+    for (const position of [...this.activePositions].filter(p => p.isRealWalletTrade)) {
+      if (position.signingMethod === 'PHANTOM') {
+        position.exitApprovalRequired = true;
+        position.exitApprovalReason = `${reason}. Emergency exit requires Phantom approval; no automatic sale was submitted.`;
+      } else {
+        await wm.oneClickExit({ positionId: position.id, pctToExit: 100, reason });
+      }
+    }
+    this.persistState();
   }
 
   setMode(mode: SystemMode): { success: boolean; message: string } {
@@ -384,6 +403,11 @@ export class EngineCoordinator {
       const micro = state?.micro.getSnapshot() ?? new MicrostructureEngine(0, pos.currentPriceSol).getSnapshot();
       const exit = ExitEngine.evaluatePosition(pos, micro);
       if (!exit.shouldExit) continue;
+      if (pos.signingMethod === 'PHANTOM') {
+        pos.exitApprovalRequired = true;
+        pos.exitApprovalReason = `${exit.reason}. Approve ${exit.action === 'FULL_EXIT' ? 100 : exit.pctToSell}% exit in Phantom; no automatic sale was submitted.`;
+        continue;
+      }
       this.pendingExits.add(pos.id);
       void WalletManager.getInstance().oneClickExit({ positionId: pos.id,
         pctToExit: exit.action === 'FULL_EXIT' ? 100 : exit.pctToSell, reason: exit.reason, tierIndex: exit.tierIndex,

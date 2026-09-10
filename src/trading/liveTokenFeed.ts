@@ -64,7 +64,7 @@ export class LiveTokenFeedService {
 
   static getInstance(): LiveTokenFeedService {
     return this.instance ??= new LiveTokenFeedService({
-      disabledReason: 'No active market-data source. Phantom connects a wallet, not a launch feed. Non-Pump discovery and safety adapters are not implemented yet.',
+      disabledReason: 'Launch discovery is disabled. Manual swaps are available under Real Wallet / Phantom. Automated signals still need a configured market feed.',
       enabled: process.env.EARLY_FEED_ENABLED === 'true' && process.env.EARLY_FEED_PROVIDER === 'PUMPPORTAL',
       apiKey: process.env.PUMPPORTAL_API_KEY,
       enableTrades: process.env.PUMPPORTAL_ENABLE_TRADES === 'true',

@@ -4,7 +4,7 @@
 
 This change preserves feed → coordinator → inspection/safety → entry decision → risk sizing → wallet/Jupiter → settlement. It does **not** establish positive expected net returns or add a non-Pump live data provider.
 
-Phantom is a wallet, not a launch venue or market-event feed. Browser connection supplies an address; autonomous signing still uses the existing dedicated local trading signer. Never export a primary Phantom wallet's secret to enable the scanner.
+Phantom is a wallet, not a launch venue or market-event feed. The [Phantom approval flow](phantom-trading.md) lets you approve individual real swaps in your existing wallet. It is separate from autonomous server signing and does not require the launch scanner for explicitly manual selections. Never export a primary Phantom wallet's secret to enable either the scanner or browser approval.
 
 No provider is selected by default (`EARLY_FEED_PROVIDER=NONE`). The old PumpPortal adapter remains explicitly selectable for observations, but new Pump buys are blocked in the coordinator and at Jupiter instruction attestation. Existing Pump positions retain SELL support. There is no non-Pump discovery/inspection adapter yet, so the requested non-Pump strategy cannot run live until one is verified. Do not restore DexScreener boosts or synthetic safety flags as a substitute.
 

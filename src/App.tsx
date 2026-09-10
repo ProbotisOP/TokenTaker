@@ -27,6 +27,7 @@ import { GrokBotStudio } from './components/GrokBotStudio.tsx';
 import { WalletAutotradeStudio } from './components/WalletAutotradeStudio.tsx';
 import { LiveMonitorTradeBanner } from './components/LiveMonitorTradeBanner.tsx';
 import { RealTradeOrderModal } from './components/RealTradeOrderModal.tsx';
+import { approvePhantomTrade } from './phantomClient.ts';
 import {
   CandidateTokenState,
   DecisionAction,
@@ -150,6 +151,9 @@ export const App: React.FC = () => {
 
   // Manual flatten single position
   const handleManualClosePosition = async (positionId: string) => {
+    if (activePositions.find(p => p.id === positionId)?.signingMethod === 'PHANTOM') {
+      return handleOneClickExit(positionId, 100);
+    }
     try {
       await fetch('/api/positions/action', {
         method: 'POST',
@@ -169,6 +173,9 @@ export const App: React.FC = () => {
     customSl?: number,
     customTp?: number
   ) => {
+    if (activePositions.find(p => p.id === positionId)?.signingMethod === 'PHANTOM' && ['FLATTEN_100', 'SCALE_OUT_50'].includes(action)) {
+      return handleOneClickExit(positionId, action === 'FLATTEN_100' ? 100 : 50);
+    }
     try {
       await fetch('/api/wallet/trade-exit', {
         method: 'POST',
@@ -190,20 +197,8 @@ export const App: React.FC = () => {
   const handleOneClickEnroll = async (candidate: CandidateTokenState, sizeSol?: number) => {
     try {
       const ticketSize = sizeSol || walletConfig?.targetTradeSizeSol || 0.02;
-      const res = await fetch('/api/wallet/one-click-enroll', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          tokenMint: candidate.metadata.mint,
-          symbol: candidate.metadata.symbol,
-          name: candidate.metadata.name,
-          sizeSol: ticketSize,
-          priceSol: candidate.micro.priceSol,
-          priceUsd: candidate.micro.priceUsd,
-          slippageBps: Math.round((walletConfig?.maxSlippagePct || 2.0) * 100),
-        }),
-      });
-      const data = await res.json();
+      const data = await approvePhantomTrade({ action: 'BUY', tokenMint: candidate.metadata.mint,
+        symbol: candidate.metadata.symbol, name: candidate.metadata.name, sizeSol: ticketSize, requireEarlySignal: true });
       fetchState();
       return data;
     } catch (err: any) {
@@ -215,6 +210,12 @@ export const App: React.FC = () => {
   // 1-Click Exit (Market Sell) from an active position
   const handleOneClickExit = async (positionId: string, pct: 100 | 50) => {
     try {
+      const position = activePositions.find(p => p.id === positionId);
+      if (position?.signingMethod === 'PHANTOM') {
+        const result = await approvePhantomTrade({ action: 'SELL', positionId, pctToExit: pct, expectedWalletAddress: position.walletAddress });
+        fetchState();
+        return result;
+      }
       const res = await fetch('/api/wallet/one-click-exit', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -250,21 +251,14 @@ export const App: React.FC = () => {
       setTradeModalCandidate(null);
       setTradeModalMint(candOrMint.trim());
       setTradeModalSymbol(symbol || 'CUSTOM');
-      setTradeModalPriceSol(priceSol || 0.00042);
-      setTradeModalPriceUsd(priceUsd || 0.071);
+      setTradeModalPriceSol(priceSol);
+      setTradeModalPriceUsd(priceUsd);
     } else {
-      if (candidates.length > 0) {
-        const first = candidates[0];
-        setTradeModalCandidate(first);
-        setTradeModalMint(first.metadata.mint);
-        setTradeModalSymbol(first.metadata.symbol);
-        setTradeModalPriceSol(first.micro.priceSol);
-        setTradeModalPriceUsd(first.micro.priceUsd);
-      } else {
-        setTradeModalCandidate(null);
-        setTradeModalMint('');
-        setTradeModalSymbol('MEME');
-      }
+      setTradeModalCandidate(null);
+      setTradeModalMint('');
+      setTradeModalSymbol('TOKEN');
+      setTradeModalPriceSol(undefined);
+      setTradeModalPriceUsd(undefined);
     }
     setRealTradeModalOpen(true);
   };
@@ -448,6 +442,7 @@ export const App: React.FC = () => {
           livePortfolio={livePortfolio}
           riskLimits={riskLimits}
           walletConfig={walletConfig}
+          onOpenWallet={() => setActiveTab('REAL_WALLET')}
         />
 
         {/* Navigation Tabs */}
@@ -476,7 +471,7 @@ export const App: React.FC = () => {
             }`}
           >
             <Wallet className="w-3.5 h-3.5 text-emerald-400" />
-            <span>Real Wallet &amp; Autotrade</span>
+            <span>Real Wallet / Phantom</span>
             <span className="px-1.5 py-0.5 rounded text-[9px] font-mono font-bold bg-emerald-950 text-emerald-300 border border-emerald-800">
               Solana Live
             </span>

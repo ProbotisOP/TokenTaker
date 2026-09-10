@@ -2,6 +2,12 @@
 
 This branch replaces the POC's fabricated live launch/safety/flow path with a causal, event-driven signal pipeline. **It does not establish profitability.** Default operation is **SHADOW**, with the market feed and live signing disabled.
 
+## Phantom approval trading
+
+Use your existing Phantom wallet with an approval popup for **every buy and sell**. No dedicated keypair or private-key import is needed. [Local setup, approval flow and limitations](docs/phantom-trading.md).
+
+Open **Real Wallet / Phantom → Connect Phantom → Enable manual Phantom trading → Review buy in Phantom**. The server needs explicit `ENABLE_LIVE_TRADING=true` and Jupiter API access. Manual swaps can run with the scanner feed disabled; they are not presented as bot-approved early entries. Stops and take-profits require your exit approval and cannot sell silently.
+
 ## Early-entry timing update
 
 [Entry stages, execution guards, measured regression evidence and the offline audit contract](docs/entry-timing.md).
@@ -30,7 +36,7 @@ Open `http://localhost:3000`. The scanner starts empty, reports its actual feed 
 
 1. The only existing live adapter is PumpPortal, now observation-only for Pump launches. Leave `EARLY_FEED_PROVIDER=NONE` for the requested non-Pump setup; it needs a separate verified venue adapter. To explicitly inspect the legacy Pump feed, both `EARLY_FEED_PROVIDER=PUMPPORTAL` and `EARLY_FEED_ENABLED=true` are required. Creation subscriptions are free.
 2. To evaluate wallet flow, configure `PUMPPORTAL_API_KEY` and explicitly set `PUMPPORTAL_ENABLE_TRADES=true`. [PumpPortal documents](https://pumpportal.fun/data-api/real-time/) a funded linked wallet requirement and metered trade events (currently 0.01 SOL per 10,000 events). Token subscriptions are capped at 100 and expire after two minutes. Consider the data cost before enabling them.
-3. Configure `SOLANA_RPC_URL` with enough capacity for confirmed account inspections. The public RPC can throttle these reads; unavailable evidence blocks entries. Configure the wallet's RPC separately in its dashboard settings if using live execution.
+3. Configure `SOLANA_RPC_URL` with enough capacity for confirmed account inspections. The public RPC can throttle these reads; unavailable evidence blocks entries. Configure the wallet's RPC separately in its dashboard settings if overriding the server default for live execution.
 4. Supply `JUPITER_API_KEY` for quote/build access where required. Never put these secrets in source control or browser code.
 5. Stay in SHADOW while collecting observations. This mode emits signals but does not create pretend fills or fictional PnL.
 
@@ -50,13 +56,13 @@ The low real-reserve floor and launch run-up cap must be considered together: a 
 
 ## Live execution safeguards
 
-Live execution additionally requires `ENABLE_LIVE_TRADING=true`, explicit LIVE-mode confirmation, a connected dedicated signer, passed preflight, and wallet authorization. Only FULL_AUTONOMOUS permits automatic signal submission. Keep a small dedicated wallet and verify the behavior in SHADOW first.
+Dedicated server signing requires `ENABLE_LIVE_TRADING=true`, explicit LIVE-mode confirmation, a connected dedicated signer, passed preflight, and wallet authorization. Only FULL_AUTONOMOUS permits automatic signal submission. The separate **Phantom approval** path requires manual LIVE enable and a fresh wallet signature for every transaction, not a dedicated keypair/preflight. It never authorizes background Phantom trading.
 
-Before entry: bounded cash/exposure/loss sizing, executable buy and sell quotes, ≤5% estimated round-trip cost including a conservative 0.0033 SOL transaction/rent reserve (not a positive-edge forecast), a fresh reinspection, a worst-fill no-chase ceiling and a final signal/mode check immediately before signing. Each candidate gets at most one automatic attempt. Missing routes never fall back to a simulated fill. Tiny orders can be blocked by transaction/rent costs even when an entry signal is confirmed; increasing frequency or chasing price is not a remedy for uneconomic order sizing.
+Before strategy entry: bounded cash/exposure/loss sizing, executable buy and sell quotes, ≤5% estimated round-trip cost including a conservative 0.0033 SOL transaction/rent reserve (not a positive-edge forecast), a fresh reinspection, a worst-fill no-chase ceiling and a final signal/mode check immediately before signing. Each candidate gets at most one automatic attempt. Missing routes never fall back to a simulated fill. Tiny orders can be blocked by transaction/rent costs even when an entry signal is confirmed; increasing frequency or chasing price is not a remedy for uneconomic order sizing.
 
 The signer accepts a deliberately narrow transaction shape: **legacy-SPL, direct single-hop Jupiter V1 `route` ExactIn**, using the documented Raydium or Meteora adapters for new buys; Pump wrapped adapters are retained for exits only, canonical wallet ATAs, bounded compute fees, authorized SOL wrapping and WSOL cleanup. Lookup tables are resolved before checking recipients/authorities/amounts. Shared-account, V2, split, referral, unknown program/adapter and token-delegation instructions are rejected. This relies on the known Jupiter and adapter programs; it is not an independent audit of those contracts. Current provider payloads outside this subset will be blocked, not silently trusted.
 
-Positions use verified token decimals and exact base units. Fills are derived from confirmed transaction balance deltas, not quotes. Stop/TP references use actual entry cost. Partial exits release proportional cost basis; a TP tier is filled only after settlement. Emergency flatten attempts real exits and retains unresolved positions rather than inventing cash. Price exits require a fresh quote. A stopped/failed data source cannot guarantee a stop-loss fill.
+Positions use verified token decimals and exact base units. Fills are derived from confirmed transaction balance deltas, not quotes. Stop/TP references use actual entry cost. Partial exits release proportional cost basis; a TP tier is filled only after settlement. Emergency flatten attempts real exits for dedicated-signer positions and requests explicit approval for Phantom positions; unconfirmed positions remain open. Price exits require a fresh quote. A stopped/failed data source cannot guarantee a stop-loss fill.
 
 ### Persistence and uncertain transactions
 

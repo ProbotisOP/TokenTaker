@@ -97,7 +97,7 @@ export class WalletManager {
     walletName: 'None',
     isConnected: false,
     network: 'mainnet-beta',
-    rpcEndpoint: 'https://api.mainnet-beta.solana.com',
+    rpcEndpoint: process.env.SOLANA_RPC_URL || 'https://api.mainnet-beta.solana.com',
     balanceSol: 0,
     balanceUsd: 0,
     gasReserveSol: 0.025,
@@ -361,7 +361,7 @@ export class WalletManager {
     try {
       const pubkey = new PublicKey(walletAddress);
       const cleanAddress = pubkey.toBase58();
-      const chosenRpc = rpcEndpoint || (network === 'devnet' ? clusterApiUrl('devnet') : 'https://api.mainnet-beta.solana.com');
+      const chosenRpc = rpcEndpoint || (network === 'devnet' ? clusterApiUrl('devnet') : process.env.SOLANA_RPC_URL || 'https://api.mainnet-beta.solana.com');
 
       this.config.walletAddress = cleanAddress;
       this.config.walletName = walletName;

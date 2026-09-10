@@ -16,6 +16,8 @@ import { GrokBotEngine } from './src/trading/grokBotEngine.ts';
 import { WalletManager } from './src/trading/walletManager.ts';
 import { LivePreflightEngine } from './src/trading/livePreflightEngine.ts';
 import { SystemMode } from './src/types.ts';
+import { PhantomTradingService } from './src/trading/phantomTradingService.ts';
+import { JupiterService } from './src/trading/jupiterService.ts';
 
 const app = express();
 const PORT = 3000;
@@ -26,6 +28,39 @@ app.use(express.json());
 const coordinator = EngineCoordinator.getInstance();
 const grokBot = GrokBotEngine.getInstance();
 const walletManager = WalletManager.getInstance();
+const phantomTrading = new PhantomTradingService({ wallet: walletManager, coordinator });
+JupiterService.isSignatureSettled = signature => coordinator.hasSettledSignature(signature);
+JupiterService.dedicatedSigningGuard = context => {
+  if (context.action === 'SELL' && coordinator.activePositions.some(position => position.signingMethod === 'PHANTOM' &&
+      position.walletAddress === context.walletAddress && position.tokenMint === context.tokenMint && position.status === 'OPEN')) {
+    throw new Error('This position requires explicit Phantom approval; server-side signing is prohibited');
+  }
+};
+
+app.use((req, _res, next) => {
+  if (req.method === 'POST' && ['/api/wallet/connect', '/api/wallet/disconnect', '/api/wallet/setup-dedicated-keypair',
+    '/api/wallet/reset-dedicated-keypair', '/api/wallet/use-dedicated-as-active', '/api/mode'].includes(req.path)) {
+    phantomTrading.invalidateConnection();
+  }
+  if (req.method === 'POST' && req.path === '/api/wallet/config' && req.body?.updates &&
+      ['walletAddress', 'isConnected', 'network', 'rpcEndpoint', 'autotradeMode'].some(key => key in req.body.updates)) {
+    phantomTrading.invalidateConnection();
+  }
+  next();
+});
+
+for (const action of ['enable', 'prepare', 'submit', 'cancel'] as const) {
+  app.post(`/api/wallet/phantom/${action}`, async (req, res) => {
+    try {
+      const result = action === 'enable' ? phantomTrading.enable(req.body ?? {}) :
+        action === 'prepare' ? await phantomTrading.prepare(req.body ?? {}) :
+          action === 'submit' ? await phantomTrading.submit(req.body ?? {}) : phantomTrading.cancel(req.body?.approvalId);
+      res.status(result.success ? 200 : 409).json(result);
+    } catch (error) {
+      res.status(400).json({ success: false, error: error instanceof Error ? error.message : 'Phantom request rejected' });
+    }
+  });
+}
 
 // Lazy Gemini AI Client Initialization
 let aiClient: GoogleGenAI | null = null;
@@ -400,6 +435,11 @@ app.post('/api/wallet/config', (req, res) => {
 app.post('/api/wallet/kill-switch', async (req, res) => {
   try {
     const { reason } = req.body;
+    if (coordinator.activePositions.some(position => position.signingMethod === 'PHANTOM')) {
+      await coordinator.triggerEmergencyStop(reason || 'Operator triggered Emergency Kill Switch');
+      return res.json({ success: true, config: walletManager.getConfig(),
+        message: 'Buy execution stopped. Phantom positions remain open and require individual exit approvals.' });
+    }
     const result = await walletManager.triggerKillSwitch(reason || 'Operator triggered Emergency Kill Switch');
     res.json(result);
   } catch (err: any) {

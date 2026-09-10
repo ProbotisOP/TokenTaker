@@ -265,6 +265,9 @@ export interface Position {
   exitReason?: string;
   isRealWalletTrade?: boolean;
   walletAddress?: string;
+  signingMethod?: 'PHANTOM';
+  exitApprovalRequired?: boolean;
+  exitApprovalReason?: string;
   executionVenue?: string;
   executionType?: 'PAPER_SIMULATED' | 'LIVE_ON_CHAIN';
   isSimulated?: boolean;

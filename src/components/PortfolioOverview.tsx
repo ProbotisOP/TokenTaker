@@ -19,6 +19,7 @@ interface PortfolioOverviewProps {
   livePortfolio?: LivePortfolioTelemetry | null;
   riskLimits: RiskLimits;
   walletConfig?: WalletAutotradeConfig | null;
+  onOpenWallet?: () => void;
 }
 
 export const PortfolioOverview: React.FC<PortfolioOverviewProps> = ({
@@ -26,7 +27,9 @@ export const PortfolioOverview: React.FC<PortfolioOverviewProps> = ({
   livePortfolio,
   riskLimits,
   walletConfig,
+  onOpenWallet,
 }) => {
+  const dedicatedAutotrade = ['FULL_AUTONOMOUS', 'SEMI_AUTONOMOUS'].includes(walletConfig?.autotradeMode ?? 'OFF');
   const solUsdRate = 170.0;
 
   // Real on-chain metrics
@@ -49,6 +52,11 @@ export const PortfolioOverview: React.FC<PortfolioOverviewProps> = ({
   const [reclaimFeedback, setReclaimFeedback] = useState<string | null>(null);
 
   const handleReclaimAll = async () => {
+    if (!dedicatedAutotrade) {
+      onOpenWallet?.();
+      setReclaimFeedback('Review each tracked exit in Real Wallet / Phantom. Each sell needs your approval.');
+      return;
+    }
     setIsReclaiming(true);
     setReclaimFeedback(null);
     try {
@@ -100,10 +108,10 @@ export const PortfolioOverview: React.FC<PortfolioOverviewProps> = ({
             onClick={handleReclaimAll}
             disabled={isReclaiming}
             className="flex items-center gap-1 px-2.5 py-1 rounded bg-amber-500/20 hover:bg-amber-500/30 border border-amber-500/50 text-[11px] font-mono font-bold text-amber-300 transition"
-            title="Convert all open meme coin bags directly back into pure SOL via Jupiter"
+            title={dedicatedAutotrade ? 'Request real exits for tracked positions only' : 'Open Phantom controls to approve each tracked exit'}
           >
             {isReclaiming ? <Loader2 className="w-3 h-3 animate-spin" /> : <Zap className="w-3 h-3 fill-current" />}
-            <span>{isReclaiming ? 'Liquidating Bags...' : '⚡ Reclaim All SOL'}</span>
+            <span>{dedicatedAutotrade ? (isReclaiming ? 'Submitting exits...' : 'Reclaim tracked positions') : 'Review exits in Phantom'}</span>
           </button>
 
           <div className="flex items-center gap-1.5 px-2.5 py-1 rounded bg-emerald-950/40 border border-emerald-500/50 text-[11px] font-mono font-bold text-emerald-300">
@@ -147,7 +155,7 @@ export const PortfolioOverview: React.FC<PortfolioOverviewProps> = ({
           </div>
           <div className="text-[10px] font-mono text-zinc-500 flex items-center justify-between">
             <span>Gas floor: {walletConfig?.gasReserveSol || 0.025} SOL</span>
-            <span className="text-emerald-400">Phantom Synced</span>
+            <span className="text-zinc-400">Last server reading</span>
           </div>
         </div>
 
@@ -166,7 +174,7 @@ export const PortfolioOverview: React.FC<PortfolioOverviewProps> = ({
             </div>
           </div>
           <div className="text-[10px] font-mono text-zinc-500">
-            Dedicated trading capital
+            Configured allocation limit
           </div>
         </div>
 
@@ -218,19 +226,19 @@ export const PortfolioOverview: React.FC<PortfolioOverviewProps> = ({
         {/* 5. Keypair Security */}
         <div className="bg-zinc-900/80 border border-zinc-800 rounded-lg p-3 flex flex-col justify-between">
           <div className="flex items-center justify-between text-zinc-400 text-xs font-mono">
-            <span>Trading Keypair</span>
+            <span>Transaction signing</span>
             <ShieldCheck className="w-3.5 h-3.5 text-emerald-400" />
           </div>
           <div className="my-1.5">
             <div className="text-sm font-mono font-bold text-emerald-400">
-              {walletConfig?.hasDedicatedKeypair ? 'SECURE WORKER' : 'KEYPAIR MISSING'}
+              {dedicatedAutotrade ? (walletConfig?.hasDedicatedKeypair ? 'DEDICATED SIGNER' : 'SIGNER MISSING') : 'PHANTOM APPROVAL'}
             </div>
             <div className="text-xs font-mono text-zinc-400 truncate">
               {walletConfig?.walletAddress ? `${walletConfig.walletAddress.slice(0, 6)}...${walletConfig.walletAddress.slice(-4)}` : 'Unconfigured'}
             </div>
           </div>
           <div className="text-[10px] font-mono text-zinc-500">
-            Private key never in UI
+            {dedicatedAutotrade ? 'Server-side signing configured' : 'No key import needed; approve in Phantom'}
           </div>
         </div>
 
@@ -242,7 +250,7 @@ export const PortfolioOverview: React.FC<PortfolioOverviewProps> = ({
           </div>
           <div className="my-1.5">
             <div className={`text-sm font-mono font-bold ${walletConfig?.lastPreflightPassed ? 'text-emerald-400' : 'text-amber-400'}`}>
-              {walletConfig?.lastPreflightPassed ? 'PREFLIGHT PASSED' : 'PREFLIGHT REQUIRED'}
+              {dedicatedAutotrade ? (walletConfig?.lastPreflightPassed ? 'PREFLIGHT PASSED' : 'PREFLIGHT REQUIRED') : 'PER-TRADE CHECKS'}
             </div>
             <div className="text-xs font-mono text-zinc-400">
               Mode: {walletConfig?.autotradeMode || '1-CLICK ONLY'}

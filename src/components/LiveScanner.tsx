@@ -45,6 +45,7 @@ export const LiveScanner: React.FC<LiveScannerProps> = ({
       setEnrollFeedback(null);
       try {
         const res = await onOneClickEnroll(c);
+        if (res && !res.success) throw new Error(res.error || 'Trade request rejected');
         if (res && res.success) {
           setEnrollFeedback({
             symbol: c.metadata.symbol,
@@ -135,7 +136,7 @@ export const LiveScanner: React.FC<LiveScannerProps> = ({
       </div>
 
       <div className="px-4 py-2 text-xs text-amber-200 bg-amber-950/20 border-b border-zinc-800">
-        {feedStatus?.error || (feedStatus?.state === 'DISABLED' ? 'No market-data feed is enabled. Phantom is your wallet, not a launch-data source. Select a supported venue/data adapter; non-Pump adapters are not implemented yet.' : 'Observed wallet flow is not verified smart money. Common funding and wash-trading networks remain unverified.')}
+        {feedStatus?.error || (feedStatus?.state === 'DISABLED' ? 'Launch discovery is disabled. Manual swaps are available under Real Wallet / Phantom. Automated signals still need a configured market feed.' : 'Observed wallet flow is not verified smart money. Common funding and wash-trading networks remain unverified.')}
       </div>
       {/* Enroll Feedback Notification */}
       {enrollFeedback && (
@@ -305,14 +306,14 @@ export const LiveScanner: React.FC<LiveScannerProps> = ({
                     onClick={() => handle1ClickBuy(c)}
                     disabled={isEnrolling || !isApproved}
                     className="flex items-center gap-1.5 px-3 py-1.5 rounded bg-emerald-500 hover:bg-emerald-400 disabled:opacity-50 text-zinc-950 text-xs font-mono font-bold transition shadow-sm"
-                    title={`1-Click Buy $${c.metadata.symbol} on-chain with dedicated trading keypair`}
+                    title={`Review $${c.metadata.symbol} buy in Phantom; approval is required`}
                   >
                     {isEnrolling ? (
                       <Loader2 className="w-3.5 h-3.5 animate-spin" />
                     ) : (
                       <Zap className="w-3.5 h-3.5 fill-current" />
                     )}
-                    <span>⚡ 1-Click Real Buy</span>
+                    <span>Review buy in Phantom</span>
                   </button>
 
                   <button

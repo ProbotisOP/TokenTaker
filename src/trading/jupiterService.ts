@@ -5,6 +5,7 @@ import path from 'node:path';
 import { lamportsToSol, toTokenHumanAmount, getOnChainTokenBalance } from './decimalSafeUtils.ts';
 import { attestSwap } from './swapAttestation.ts';
 import { TradeSafetyValidator } from './tradeSafetyValidator.ts';
+import { verifyPhantomSignature } from './phantomSignature.ts';
 
 export const SOL_MINT = 'So11111111111111111111111111111111111111112';
 export const USDC_MINT = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
@@ -68,6 +69,7 @@ export interface ExecutionContext {
   quoteFetchedAt: number;
   // Called immediately before signing, after every asynchronous guard has finished.
   finalGuard: () => void;
+  isSignatureSettled?: (signature: string) => boolean;
 }
 export interface PendingExecution {
   signature: string;
@@ -87,6 +89,8 @@ export class JupiterService {
   private static JUPITER_SWAP_API = 'https://api.jup.ag/swap/v1/swap';
   private static pending: Map<string, PendingExecution> | null = null;
   private static journalPath = path.join(process.cwd(), '.execution-pending.json');
+
+  private static liveTradingEnabled(): boolean { return process.env.ENABLE_LIVE_TRADING === 'true'; }
 
   private static loadPending(): Map<string, PendingExecution> {
     if (!this.pending) {
@@ -137,8 +141,10 @@ export class JupiterService {
       url.searchParams.set('slippageBps', String(slippageBps));
       url.searchParams.set('restrictIntermediateTokens', 'true');
       url.searchParams.set('onlyDirectRoutes', 'true');
+      url.searchParams.set('instructionVersion', 'V1');
       const response = await fetch(url, { headers: { Accept: 'application/json',
         ...(process.env.JUPITER_API_KEY ? { 'x-api-key': process.env.JUPITER_API_KEY } : {}) }, signal: AbortSignal.timeout(5000) });
+      if (response.status === 401 || response.status === 403) throw new Error('Jupiter quote access denied. Configure JUPITER_API_KEY on the local server; this is an API credential, not your Phantom private key.');
       if (!response.ok) throw new Error(`Jupiter quote HTTP ${response.status}`);
       const data = await response.json();
       if (!data?.outAmount || !Array.isArray(data.routePlan)) throw new Error('Malformed quote');
@@ -205,29 +211,60 @@ export class JupiterService {
     return { tokenBaseUnits: tokens.toString(), tokenDecimals: context.tokenDecimals, solLamports: sol.toString(), feeLamports: meta.fee };
   }
 
+  public static dedicatedSigningGuard?: (context: ExecutionContext) => void;
+  public static isSignatureSettled?: (signature: string) => boolean;
+
   public static async signAndExecuteSwap(connection: Connection, versionedTx: VersionedTransaction, keypair: Keypair,
     lastValidBlockHeight?: number, context?: ExecutionContext): Promise<JupiterLiveExecutionResult> {
+    return this.executeGuardedSwap(connection, versionedTx, lastValidBlockHeight, context, () => {
+      if (context?.walletAddress !== keypair.publicKey.toBase58()) throw new Error('Foreign signing wallet');
+      this.dedicatedSigningGuard?.(context);
+      versionedTx.sign([keypair]);
+    });
+  }
+
+  public static async executeExternallySignedSwap(connection: Connection, versionedTx: VersionedTransaction,
+    lastValidBlockHeight: number, context: ExecutionContext, originalMessage: Uint8Array,
+    refreshGuard: () => Promise<void>): Promise<JupiterLiveExecutionResult> {
+    return this.executeGuardedSwap(connection, versionedTx, lastValidBlockHeight, context,
+      () => verifyPhantomSignature(versionedTx, context.walletAddress, originalMessage), async () => {
+        verifyPhantomSignature(versionedTx, context.walletAddress, originalMessage);
+        await refreshGuard();
+        const [height, valid] = await Promise.all([connection.getBlockHeight('confirmed'),
+          connection.isBlockhashValid(versionedTx.message.recentBlockhash, { commitment: 'confirmed' })]);
+        if (!Number.isSafeInteger(height) || height < 0 || height > lastValidBlockHeight || valid.value !== true) throw new Error('Original Phantom transaction blockhash expired or unverifiable');
+      });
+  }
+
+  private static async executeGuardedSwap(connection: Connection, versionedTx: VersionedTransaction,
+    lastValidBlockHeight: number | undefined, context: ExecutionContext | undefined, authorize: () => void,
+    refreshGuard?: () => Promise<void>): Promise<JupiterLiveExecutionResult> {
     let signature: string | undefined;
     let pending: PendingExecution | undefined;
+    let broadcastAttempted = false;
     try {
-      if (process.env.ENABLE_LIVE_TRADING !== 'true') throw new Error('ENABLE_LIVE_TRADING must explicitly equal true');
+      if (!this.liveTradingEnabled()) throw new Error('ENABLE_LIVE_TRADING must explicitly equal true');
       if (!context || !Number.isSafeInteger(lastValidBlockHeight) || lastValidBlockHeight! <= 0) throw new Error('Missing guarded execution context or original block height');
-      if (context.walletAddress !== keypair.publicKey.toBase58()) throw new Error('Foreign signing wallet');
       if (this.hasPendingExecution(context.walletAddress, context.action === 'BUY' ? undefined : context.tokenMint)) throw new Error('Pending execution requires reconciliation');
       await this.attestTransaction(connection, versionedTx, context);
+      await refreshGuard?.();
       if (!Number.isFinite(context.quoteFetchedAt) || Date.now() - context.quoteFetchedAt > TradeSafetyValidator.MAX_QUOTE_AGE_MS || context.quoteFetchedAt > Date.now()) throw new Error('Stale quote at signer');
       TradeSafetyValidator.validateCompiledTransaction({ versioned_tx: versionedTx, wallet_pubkey: context.walletAddress,
         intended_action: context.action, intended_token_mint: context.tokenMint });
       context.finalGuard();
       TradeSafetyValidator.validateCompiledTransaction({ versioned_tx: versionedTx, wallet_pubkey: context.walletAddress,
         intended_action: context.action, intended_token_mint: context.tokenMint });
-      versionedTx.sign([keypair]);
+      if (this.hasPendingExecution(context.walletAddress, context.action === 'BUY' ? undefined : context.tokenMint)) throw new Error('Pending execution requires reconciliation');
+      authorize();
       signature = bs58.encode(versionedTx.signatures[0]);
+      if (this.isSignatureSettled?.(signature) || context.isSignatureSettled?.(signature)) throw new Error('Transaction signature already settled; duplicate broadcast rejected');
+      const wire = versionedTx.serialize();
       pending = { signature, walletAddress: context.walletAddress, tokenMint: context.tokenMint, action: context.action,
         blockhash: versionedTx.message.recentBlockhash, lastValidBlockHeight: lastValidBlockHeight!, status: 'UNKNOWN', submittedAt: Date.now() };
       this.loadPending().set(signature, pending);
       this.persistPending();
-      const txid = await connection.sendRawTransaction(versionedTx.serialize(), { skipPreflight: false, maxRetries: 3, preflightCommitment: 'confirmed' });
+      broadcastAttempted = true;
+      const txid = await connection.sendRawTransaction(wire, { skipPreflight: false, maxRetries: 3, preflightCommitment: 'confirmed' });
       if (txid !== signature) throw new Error('RPC returned a different signature');
       const confirmation = await connection.confirmTransaction({ signature, blockhash: pending.blockhash,
         lastValidBlockHeight: pending.lastValidBlockHeight }, 'confirmed');
@@ -242,13 +279,20 @@ export class JupiterService {
       this.persistPending();
       return { success: true, status: 'CONFIRMED', txSignature: signature, explorerUrl: `https://solscan.io/tx/${signature}`, fill };
     } catch (err: any) {
+      if (!broadcastAttempted) {
+        if (pending) {
+          this.loadPending().delete(pending.signature);
+          try { this.persistPending(); } catch { /* Storage must be repaired before any later submission can be journaled. */ }
+        }
+        return { success: false, status: 'REJECTED', error: `Not broadcast by server: ${err.message}` };
+      }
       if (pending) {
         pending.error = err.message;
         // Retain even when RPC send itself throws: the signed bytes may have reached a node.
         this.loadPending().set(pending.signature, pending);
         try { this.persistPending(); } catch { /* Keep the process-local block if disk fails. */ }
       }
-      return { success: false, status: signature ? 'UNKNOWN' : 'REJECTED', txSignature: signature, error: err.message };
+      return { success: false, status: 'UNKNOWN', txSignature: signature, error: err.message };
     }
   }
 
