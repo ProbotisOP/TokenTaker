@@ -54,7 +54,7 @@ function reset(positions: any[] = []) {
   JupiterService.executeRealSellSwap = originalSell;
   service.pending = new Map();
   JupiterService.attestTransaction = async () => {};
-  coordinator = { config: { mode: 'LIVE' }, riskLimits: { circuitBreakerActive: false, maxConsecutiveLosses: 3, maxPositionPercent: .05, maxTokenExposurePercent: .08, maxOpenPositions: 6, maxTradeLossSol: 1 },
+  coordinator = { config: { mode: 'LIVE' }, riskLimits: { maxSlippagePercent: 2.5, circuitBreakerActive: false, maxConsecutiveLosses: 3, maxPositionPercent: .05, maxTokenExposurePercent: .08, maxOpenPositions: 6, maxTradeLossSol: 1 },
     activePositions: positions, closedPositions: [], portfolio: { cashSol: 10, equitySol: 10, currentDrawdownPct: 0,
       dailyRealizedPnlSol: 0, totalRealizedPnlSol: 0, consecutiveLosses: 0 }, recalculatePortfolio() {}, persistSettlement() {} };
   wallet = Object.create(WalletManager.prototype);
@@ -319,6 +319,43 @@ async function main() {
     const second = await wallet.executeSignalTrade({ tokenMint: BONK_MINT, symbol: 'TEST', recommendedSizeSol: .02 });
     assert.equal(second.success, false); assert.match(second.error, /progress/);
     release(); assert.equal((await first).success, true);
+  });
+  await test('wallet slippage cannot override a tighter system risk limit', async () => {
+    mockBuy(); mockDecimalsForWallet();
+    coordinator.riskLimits.maxSlippagePercent = 1;
+    const result = await wallet.oneClickEnroll({ ...buyRequest, slippageBps: 250 });
+    assert.equal(result.success, false); assert.match(result.error, /slippage/);
+  });
+  await test('unknown signal mints reject instead of falling back to manual execution', async () => {
+    mockBuy(); mockDecimalsForWallet();
+    coordinator.createSignalGuard = () => { throw new Error('No observed launch signal for this token'); };
+    let signed = false;
+    JupiterService.signAndExecuteSwap = async () => { signed = true; return { success: false }; };
+    const result = await wallet.executeSignalTrade({ tokenMint: BONK_MINT, symbol: 'TEST', recommendedSizeSol: .02 });
+    assert.equal(result.success, false); assert.match(result.error, /No observed launch signal/); assert.equal(signed, false);
+  });
+  await test('strategy entry validates and attests the exact worst-fill exit before buying', async () => {
+    mockBuy(); mockDecimalsForWallet();
+    const buyQuote = JupiterService.fetchQuote;
+    JupiterService.fetchQuote = async params => params.inputMint === SOL_MINT ? buyQuote(params) : ({ success: true, data: {
+      inputMint: BONK_MINT, outputMint: SOL_MINT, inAmount: '1950000', outAmount: '19900000',
+      otherAmountThreshold: '19000000', fetchedAt: now, slippageBps: 250, priceImpactPct: '0.1',
+    } });
+    const validations: string[] = [];
+    TradeSafetyValidator.validateQuote = async (_c, params) => {
+      validations.push(params.intended_action);
+      if (params.intended_action === 'SELL') assert.equal(params.intended_token_base_units, 1950000n);
+      return { is_valid: true, token_decimals: 6, diagnostic_record: {} as any };
+    };
+    JupiterService.attestTransaction = async (_c, _tx, intent) => {
+      assert.equal(intent.action, 'SELL'); assert.equal(intent.inputBaseUnits, '1950000');
+      throw new Error('unsupported exit adapter');
+    };
+    let signed = false;
+    JupiterService.signAndExecuteSwap = async () => { signed = true; return { success: false }; };
+    const result = await wallet.oneClickEnroll(buyRequest, { maxEntryPriceSol: .02, validate() {}, validateQuote() {} });
+    assert.equal(result.success, false); assert.match(result.error, /unsupported exit adapter/);
+    assert.deepEqual(validations, ['BUY', 'SELL']); assert.equal(signed, false);
   });
   await test('final buy guard catches kill switch or mode change during async build', async () => {
     for (const mutate of [() => { wallet.config.killSwitchActive = true; }, () => { coordinator.config.mode = 'SHADOW'; },

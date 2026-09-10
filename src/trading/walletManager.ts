@@ -30,6 +30,8 @@ import {
   getOnChainTokenDecimals,
 } from './decimalSafeUtils.ts';
 import { TradeSafetyValidator } from './tradeSafetyValidator.ts';
+import type { SignalExecutionGuard } from './entryExecutionGuard.ts';
+import { estimateRoundTripCostPct } from './executionCost.ts';
 
 const SOL_USD_ESTIMATE = 170.0;
 const KEYPAIR_FILE_PATH = path.join(process.cwd(), '.secure_trading_keypair.json');
@@ -528,7 +530,9 @@ export class WalletManager {
     const amount = lamportsToSol(solToLamports(req.sizeSol));
     if (amount < c.minTradeSizeSol || amount > c.maxTradeSizeSol) throw new Error('Trade size outside configured limits');
     const slippage = req.slippageBps ?? Math.floor(c.maxSlippagePct * 100);
-    if (!Number.isInteger(slippage) || slippage < 0 || slippage > c.maxSlippagePct * 100) throw new Error('Invalid buy slippage');
+    if (!Number.isInteger(slippage) || slippage < 0 || slippage > c.maxSlippagePct * 100 ||
+        !Number.isFinite(coordinator.riskLimits.maxSlippagePercent) || coordinator.riskLimits.maxSlippagePercent <= 0 ||
+        slippage > coordinator.riskLimits.maxSlippagePercent * 100) throw new Error('Invalid buy slippage');
     if (Date.now() - this.lastBalanceCheck > 15_000 || !this.lastBalanceCheck) throw new Error('Fresh on-chain balance required');
     if (amount + c.gasReserveSol + 0.003 > c.balanceSol) throw new Error('Insufficient cash after gas, fee and rent reserve');
     const open = coordinator.activePositions.filter(p => p.isRealWalletTrade && p.status === 'OPEN');
@@ -545,13 +549,17 @@ export class WalletManager {
     if (JupiterService.hasPendingExecution(c.walletAddress!)) throw new Error('Pending wallet execution requires reconciliation before buying');
   }
 
-  public async oneClickEnroll(req: OneClickEnrollRequest, signalGuard?: { validate: () => void; maxEntryPriceSol: number }): Promise<OneClickEnrollResult> {
+  public async oneClickEnroll(req: OneClickEnrollRequest, signalGuard?: SignalExecutionGuard): Promise<OneClickEnrollResult> {
     const timestamp = Date.now();
     const failure = (error: string, txSignature?: string): OneClickEnrollResult => ({ success: false, tokenMint: req.tokenMint,
       symbol: req.symbol, sizeSol: req.sizeSol, timestamp, error, txSignature });
     if (this.buyInFlight) return failure('Another wallet buy is in progress');
     this.buyInFlight = true;
     try {
+      const coordinator = EngineCoordinator.getInstance();
+      if (!signalGuard && coordinator.candidateTokens?.some(c => c.metadata.mint === req.tokenMint)) {
+        signalGuard = coordinator.createSignalGuard(req.tokenMint);
+      }
       this.assertWalletProvenance();
       await this.refreshBalance();
       this.assertBuyAllowed(req);
@@ -567,6 +575,22 @@ export class WalletManager {
       if (signalGuard) {
         const worstPrice = req.sizeSol / toTokenHumanAmount(quote.data.otherAmountThreshold, valid.token_decimals);
         if (!Number.isFinite(worstPrice) || worstPrice > signalGuard.maxEntryPriceSol) return failure('Execution price exceeds the no-chase entry ceiling');
+        if (signalGuard.validateQuote) {
+          const exit = await JupiterService.fetchQuote({ inputMint: req.tokenMint, outputMint: SOL_MINT,
+            amountLamports: BigInt(quote.data.otherAmountThreshold), slippageBps });
+          if (!exit.success || !exit.data) return failure('No executable exit quote for final entry size');
+          await TradeSafetyValidator.validateQuote(connection, { intended_action: 'SELL', intended_token_mint: req.tokenMint,
+            intended_token_base_units: BigInt(quote.data.otherAmountThreshold), quote_response: exit.data,
+            wallet_pubkey: signer.publicKey.toBase58(), max_slippage_bps: slippageBps });
+          const exitBuild = await JupiterService.buildSwapTransaction(exit.data, signer.publicKey.toBase58(), 150_000);
+          if (!exitBuild.success || !exitBuild.versionedTx) return failure('Exit route cannot be built by the configured executor');
+          await JupiterService.attestTransaction(connection, exitBuild.versionedTx, { action: 'SELL', tokenMint: req.tokenMint,
+            walletAddress: signer.publicKey.toBase58(), inputBaseUnits: quote.data.otherAmountThreshold,
+            minimumOutputBaseUnits: exit.data.otherAmountThreshold });
+          signalGuard.validateQuote({ now: Date.now(), quoteFetchedAt: quote.data.fetchedAt,
+            exitQuoteFetchedAt: exit.data.fetchedAt, worstEntryPriceSol: worstPrice,
+            roundTripCostPct: estimateRoundTripCostPct(req.sizeSol, lamportsToSol(exit.data.otherAmountThreshold)) });
+        }
       }
       const built = await JupiterService.buildSwapTransaction(quote.data, signer.publicKey.toBase58(), 150_000);
       if (!built.success || !built.versionedTx) return failure(built.error || 'Buy build failed');
@@ -603,7 +627,6 @@ export class WalletManager {
         executionVenue: 'Jupiter DEX / Solana Mainnet', txSignature: result.txSignature, solscanUrl: result.explorerUrl,
         executionHistory: [{ action: 'BUY', priceSol: price, tokens, pnlSol: 0, timestamp, txSignature: result.txSignature }],
       };
-      const coordinator = EngineCoordinator.getInstance();
       coordinator.activePositions.unshift(position);
       coordinator.portfolio.cashSol -= actualCost;
       this.config.balanceSol = Math.max(0, this.config.balanceSol - actualCost);
@@ -919,10 +942,19 @@ export class WalletManager {
    * Executes a real on-chain trade (LIVE) or simulated paper trade (PAPER).
    * ZERO silent fallbacks!
    */
-  public async executeSignalTrade(request: SignalTradeTriggerRequest, signalGuard?: { validate: () => void; maxEntryPriceSol: number }): Promise<SignalTradeResult> {
-    const result = await this.oneClickEnroll({ tokenMint: request.tokenMint, symbol: request.symbol, name: request.name,
-      sizeSol: request.recommendedSizeSol ?? this.config.targetTradeSizeSol,
-      priceSol: request.priceSol, priceUsd: request.priceUsd }, signalGuard);
+  public async executeSignalTrade(request: SignalTradeTriggerRequest, signalGuard?: SignalExecutionGuard): Promise<SignalTradeResult> {
+    let result: OneClickEnrollResult;
+    const sizeSol = request.recommendedSizeSol ?? this.config.targetTradeSizeSol;
+    try {
+      if (this.buyInFlight) throw new Error('Another wallet buy is in progress');
+      signalGuard ??= EngineCoordinator.getInstance().createSignalGuard(request.tokenMint);
+      result = await this.oneClickEnroll({ tokenMint: request.tokenMint, symbol: request.symbol, name: request.name,
+        sizeSol, slippageBps: Math.floor(Math.min(this.config.maxSlippagePct, EngineCoordinator.getInstance().riskLimits.maxSlippagePercent) * 100),
+        priceSol: request.priceSol, priceUsd: request.priceUsd }, signalGuard);
+    } catch (error) {
+      result = { success: false, tokenMint: request.tokenMint, symbol: request.symbol, sizeSol, timestamp: Date.now(),
+        error: error instanceof Error ? error.message : 'Signal authorization failed' };
+    }
     return { ...result, priceSol: result.priceSol ?? 0, slippagePct: this.config.maxSlippagePct,
       priorityFeeSol: 0, mode: this.config.autotradeMode,
       executionType: result.success ? 'LIVE_ON_CHAIN' : undefined, isSimulated: false };
@@ -936,16 +968,11 @@ export class WalletManager {
     sizeSol?: number
   ): Promise<SignalTradeResult> {
     const symbol = tokenMint.startsWith('Dez') ? 'BONK' : 'TEST_ALPHA';
-    return this.executeSignalTrade({
-      tokenMint,
-      symbol,
-      name: symbol === 'BONK' ? 'Bonk Doge' : 'Preflight Test Token',
-      priceSol: 0.00000014,
-      priceUsd: 0.0000238,
-      signalSource: 'PREFLIGHT_ONBOARDING_DIAGNOSTIC',
-      signalScore: 92,
-      recommendedSizeSol: sizeSol || this.config.minTradeSizeSol,
-    });
+    const result = await this.oneClickEnroll({ tokenMint, symbol, name: 'Operator preflight test',
+      sizeSol: sizeSol ?? this.config.minTradeSizeSol });
+    return { ...result, priceSol: result.priceSol ?? 0, slippagePct: this.config.maxSlippagePct,
+      priorityFeeSol: 0, mode: this.config.autotradeMode,
+      executionType: result.success ? 'LIVE_ON_CHAIN' : undefined, isSimulated: false };
   }
 
   /**

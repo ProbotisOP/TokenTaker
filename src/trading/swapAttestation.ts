@@ -97,6 +97,8 @@ export async function attestSwap(connection: Connection, tx: VersionedTransactio
       requireSafe(data.readUInt32LE(8) === 1 && data[13] === 100 && data[14] === 0 && data[15] === 1, 'UNSUPPORTED_ROUTE_PLAN');
       const variant = data[12];
       requireSafe([7, 19, 26, 38, 46, 49, 50].includes(variant), 'UNSUPPORTED_SWAP_ADAPTER');
+      // Existing positions must retain an exit path even when new Pump exposure is disabled.
+      requireSafe(intent.action === 'SELL' || ![49, 50].includes(variant), 'PUMP_BUYS_DISABLED');
       requireSafe(variant !== 49 || intent.action === 'BUY', 'REVERSED_PUMP_ROUTE');
       requireSafe(variant !== 50 || intent.action === 'SELL', 'REVERSED_PUMP_ROUTE');
       requireSafe(data.readBigUInt64LE(16) === BigInt(intent.inputBaseUnits), 'WRONG_ROUTE_INPUT_AMOUNT');

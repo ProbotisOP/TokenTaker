@@ -5,8 +5,8 @@ import {
 } from '../types.ts';
 import { DEFAULT_RISK_LIMITS, DEFAULT_STRATEGY_WEIGHTS, DEFAULT_SYSTEM_CONFIG, SystemConfig } from './config.ts';
 import { TradingStateStore } from './tradingStateStore.ts';
-import { DEFAULT_ENTRY_POLICY, EarlyEntryEngine } from './earlyEntryEngine.ts';
-import { estimateRoundTripCostPct } from './executionCost.ts';
+import { EarlyEntryEngine } from './earlyEntryEngine.ts';
+import { createEntryExecutionGuard, type SignalExecutionGuard } from './entryExecutionGuard.ts';
 import { ExitEngine } from './exitEngine.ts';
 import { MicrostructureEngine, SwapTick } from './microstructureEngine.ts';
 import { RiskEngine } from './riskEngine.ts';
@@ -17,7 +17,7 @@ import { WalletManager } from './walletManager.ts';
 import { LaunchEvent, LiveTokenFeedService } from './liveTokenFeed.ts';
 import { LaunchInspection, LaunchInspector } from './launchInspector.ts';
 import { JupiterService, SOL_MINT } from './jupiterService.ts';
-import { getOnChainTokenDecimals, lamportsToSol, solToLamports, toTokenBaseUnits } from './decimalSafeUtils.ts';
+import { getOnChainTokenDecimals, lamportsToSol, toTokenBaseUnits } from './decimalSafeUtils.ts';
 
 export type { CandidateTokenState } from '../types.ts';
 
@@ -177,7 +177,7 @@ export class EngineCoordinator {
       executionPreCheck: emptyPrecheck(event.mint), detected_at: event.detectedAt,
       parsed_at: now, scored_at: now, decision_at: now, decision: DecisionAction.WAIT,
       decisionReasons: ['Waiting for real trade observations and on-chain inspection'], recentWallets: [],
-      entryStage: 'OBSERVING', dataSource: 'PUMPPORTAL', executionStatus: 'NOT_SUBMITTED',
+      entryStage: 'EARLY_ACCUMULATION', dataSource: 'PUMPPORTAL', executionStatus: 'NOT_SUBMITTED',
     };
     this.candidateTokens.unshift(candidate);
     if (this.candidateTokens.length > 100) {
@@ -210,6 +210,7 @@ export class EngineCoordinator {
       const inspection = await this.inspector.inspect(state.event);
       state.inspection = inspection;
       state.entry.observePrice(inspection.priceSol);
+      state.entry.recordInspection(inspection);
       candidate.metadata.created_at = inspection.createdAt;
       candidate.metadata.creator = inspection.creator;
       candidate.metadata.tokenProgram = inspection.tokenProgram;
@@ -253,7 +254,7 @@ export class EngineCoordinator {
     for (const candidate of [...this.candidateTokens].reverse()) {
       if (this.inspectionCount >= 2) break;
       const state = this.observed.get(candidate.metadata.mint);
-      if (state && !state.inspecting && state.nextInspectionAt <= Date.now() && !['REJECTED', 'EXPIRED'].includes(candidate.entryStage || '')) {
+      if (state && !state.inspecting && state.nextInspectionAt <= Date.now() && !['REJECTED', 'EXPIRED', 'EXPANSION', 'EXTENDED', 'EXHAUSTED'].includes(candidate.entryStage || '')) {
         void this.inspectCandidate(candidate.metadata.mint);
       }
     }
@@ -302,6 +303,22 @@ export class EngineCoordinator {
     }
   }
 
+  createSignalGuard(mint: string, autonomous = false): SignalExecutionGuard {
+    const state = this.observed.get(mint);
+    const candidate = this.candidateTokens.find(c => c.metadata.mint === mint);
+    if (!state || !candidate) throw new Error('No observed launch signal for this token');
+    if (candidate.metadata.launchVenue === LaunchVenue.PUMPFUN) throw new Error('Pump buys are disabled; a non-Pump discovery/inspection adapter is required');
+    this.evaluateCandidate(candidate, state, Date.now());
+    return createEntryExecutionGuard({
+      initialPriceSol: state.event.initialPriceSol, evaluation: candidate.entryMetrics!, startedAt: Date.now(),
+      validateSignal: () => {
+        this.evaluateCandidate(candidate, state, Date.now());
+        if (candidate.decision !== DecisionAction.BUY || this.config.mode !== SystemMode.LIVE || this.riskLimits.circuitBreakerActive ||
+            (autonomous && WalletManager.getInstance().getConfig().autotradeMode !== 'FULL_AUTONOMOUS')) throw new Error('Signal expired or risk/mode changed before signing');
+      },
+    });
+  }
+
   private async executeBuyOrder(candidate: CandidateTokenState, state: ObservedLaunch): Promise<void> {
     const wm = WalletManager.getInstance();
     const cfg = wm.getConfig();
@@ -314,16 +331,8 @@ export class EngineCoordinator {
       gasReserveSol: cfg.gasReserveSol, minTradeSizeSol: cfg.minTradeSizeSol, targetTradeSizeSol: cfg.targetTradeSizeSol,
     });
     if (!risk.approved) throw new Error(risk.rejectReasons.join('; '));
+    const guard = this.createSignalGuard(candidate.metadata.mint, true);
     candidate.executionStatus = 'CHECKING_ROUTE';
-    const amount = solToLamports(risk.recommendedSizeSol);
-    const buy = await JupiterService.fetchQuote({ inputMint: SOL_MINT, outputMint: candidate.metadata.mint,
-      amountLamports: amount, slippageBps: Math.floor(this.riskLimits.maxSlippagePercent * 100) });
-    if (!buy.success || !buy.data) throw new Error('No executable entry route; early curve may not be supported by Jupiter');
-    const sell = await JupiterService.fetchQuote({ inputMint: candidate.metadata.mint, outputMint: SOL_MINT,
-      amountLamports: BigInt(buy.data.outAmount), slippageBps: Math.floor(this.riskLimits.maxSlippagePercent * 100) });
-    if (!sell.success || !sell.data) throw new Error('No executable exit route');
-    const roundTripCostPct = estimateRoundTripCostPct(risk.recommendedSizeSol, lamportsToSol(sell.data.otherAmountThreshold));
-    if (roundTripCostPct > 5) throw new Error(`Estimated round-trip cost (${roundTripCostPct.toFixed(1)}%) exceeds 5% budget, including fees and rent`);
     await this.inspectCandidate(candidate.metadata.mint);
     this.evaluateCandidate(candidate, state, Date.now());
     if (candidate.decision !== DecisionAction.BUY || this.config.mode !== SystemMode.LIVE || this.riskLimits.circuitBreakerActive) throw new Error('Entry no longer confirmed after route checks');
@@ -331,14 +340,7 @@ export class EngineCoordinator {
       tokenMint: candidate.metadata.mint, symbol: candidate.metadata.symbol, name: candidate.metadata.name,
       priceSol: candidate.micro.priceSol, priceUsd: candidate.micro.priceUsd, signalSource: 'EARLY_CONFIRMED',
       signalScore: candidate.opportunity.opportunityScore, recommendedSizeSol: risk.recommendedSizeSol,
-    }, {
-      maxEntryPriceSol: state.event.initialPriceSol * (1 + DEFAULT_ENTRY_POLICY.maxRunupPct / 100),
-      validate: () => {
-        this.evaluateCandidate(candidate, state, Date.now());
-        if (candidate.decision !== DecisionAction.BUY || this.config.mode !== SystemMode.LIVE ||
-            wm.getConfig().autotradeMode !== 'FULL_AUTONOMOUS') throw new Error('Signal expired or live mode changed before signing');
-      },
-    });
+    }, guard);
     candidate.executionStatus = result.success ? 'CONFIRMED' : 'BLOCKED';
     candidate.executionError = result.error;
   }

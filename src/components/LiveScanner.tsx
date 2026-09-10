@@ -99,18 +99,19 @@ export const LiveScanner: React.FC<LiveScannerProps> = ({
     }
   };
 
-  const getDecisionBadge = (decision: DecisionAction) => {
+  const getDecisionBadge = (candidate: CandidateTokenState) => {
+    const decision = candidate.decision;
     if (decision === DecisionAction.BUY) {
       return (
         <span className="px-2 py-0.5 rounded text-[11px] font-mono font-bold bg-emerald-500 text-zinc-950 uppercase tracking-wider flex items-center gap-1">
           <Zap className="w-3 h-3 fill-current" />
-          ENTRY CONFIRMED
+          {candidate.entryMetrics?.label ?? 'BUY — CLEAN EARLY ENTRY'}
         </span>
       );
     }
     return (
       <span className="px-2 py-0.5 rounded text-[11px] font-mono font-semibold bg-zinc-800 text-zinc-400 border border-zinc-700">
-        {decision === DecisionAction.WAIT ? 'OBSERVING' : 'REJECTED'}
+        {candidate.entryMetrics?.label ?? (decision === DecisionAction.WAIT ? 'WAIT — EARLY SETUP, NEED CONFIRMATION' : 'REJECTED')}
       </span>
     );
   };
@@ -134,7 +135,7 @@ export const LiveScanner: React.FC<LiveScannerProps> = ({
       </div>
 
       <div className="px-4 py-2 text-xs text-amber-200 bg-amber-950/20 border-b border-zinc-800">
-        {feedStatus?.error || (feedStatus?.state === 'DISABLED' ? 'Feed disabled. Configure EARLY_FEED_ENABLED and a funded PumpPortal trade feed to collect observations.' : 'Observed wallet flow is not verified smart money. Common funding and wash-trading networks remain unverified.')}
+        {feedStatus?.error || (feedStatus?.state === 'DISABLED' ? 'No market-data feed is enabled. Phantom is your wallet, not a launch-data source. Select a supported venue/data adapter; non-Pump adapters are not implemented yet.' : 'Observed wallet flow is not verified smart money. Common funding and wash-trading networks remain unverified.')}
       </div>
       {/* Enroll Feedback Notification */}
       {enrollFeedback && (
@@ -235,7 +236,7 @@ export const LiveScanner: React.FC<LiveScannerProps> = ({
                       {c.metadata.launchVenue}
                     </span>
                     {getRiskBadge(c.safety.riskLevel, c.safety.safetyScore)}
-                    {getDecisionBadge(c.decision)}
+                    {getDecisionBadge(c)}
                   </div>
 
                   {/* Micro attributes */}
@@ -296,7 +297,7 @@ export const LiveScanner: React.FC<LiveScannerProps> = ({
                   <div className="text-right font-mono">
                     <div className="text-[11px] text-zinc-500">Observed for</div>
                     <div className="text-xs font-bold text-cyan-400">{(latencyMs / 1000).toFixed(1)}s</div>
-                    <div className="text-[9px] text-zinc-600">{c.entryStage}</div>
+                    <div className="text-[9px] text-zinc-600">{c.entryStage?.replaceAll('_', ' ')}</div>
                   </div>
 
                   {/* ⚡ 1-Click Real Buy Button */}

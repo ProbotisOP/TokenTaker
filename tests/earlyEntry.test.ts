@@ -23,10 +23,10 @@ test('fresh detection is WAIT, not an immediate buy', () => {
 });
 test('distributed accumulation confirms before expansion', () => {
   const engine = new EarlyEntryEngine(1);
-  assert.equal(accumulate(engine, 8).stage, 'ACCUMULATING');
+  assert.equal(accumulate(engine, 8).stage, 'CONFIRMATION');
   let result;
   for (let i = 9; i <= 11; i++) { engine.record(tick(i), start + i * 1000); result = evaluate(engine, i); }
-  assert.equal(result!.stage, 'CONFIRMED');
+  assert.equal(result!.stage, 'CONFIRMATION');
   assert.ok(result!.runupPct < 3);
 });
 test('unknown safety or creation time cannot approve', () => {
@@ -42,7 +42,7 @@ test('one wallet cannot manufacture independent accumulation', () => {
 test('stale flow resets confirmation and cannot buy from a timer', () => {
   const engine = new EarlyEntryEngine(1);
   accumulate(engine, 8);
-  assert.equal(evaluate(engine, 12).stage, 'OBSERVING');
+  assert.equal(evaluate(engine, 12).stage, 'EARLY_ACCUMULATION');
   engine.record(tick(13), start + 13_000);
   assert.notEqual(evaluate(engine, 13).decision, DecisionAction.BUY);
 });

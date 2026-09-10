@@ -15,7 +15,7 @@ function fixture(action: 'BUY' | 'SELL' = 'BUY') {
   const input = action === 'BUY' ? sol : token, output = action === 'BUY' ? token : sol;
   const data = Buffer.alloc(35);
   createHash('sha256').update('global:route').digest().copy(data, 0, 0, 8);
-  data.writeUInt32LE(1, 8); data[12] = action === 'BUY' ? 49 : 50;
+  data.writeUInt32LE(1, 8); data[12] = 7;
   data[13] = 100; data[15] = 1;
   data.writeBigUInt64LE(20_000_000n, 16); data.writeBigUInt64LE(10_000_000n, 24); data.writeUInt16LE(250, 32);
   const route = new TransactionInstruction({ programId: JUPITER_PROGRAM, data,
@@ -55,6 +55,12 @@ for (const [label, mutate] of [
 ] as const) test(`rejects ${label}`, async () => {
   const f = fixture(); mutate(f);
   await assert.rejects(attestSwap(connection, f.tx(), f.intent), /TRADE_REJECTED/);
+});
+test('Pump entries reject while selling existing Pump exposure stays possible', async () => {
+  const buy = fixture(); buy.route.data[12] = 49;
+  await assert.rejects(attestSwap(connection, buy.tx(), buy.intent), /PUMP_BUYS_DISABLED/);
+  const sell = fixture('SELL'); sell.route.data[12] = 50;
+  await attestSwap(connection, sell.tx(), sell.intent);
 });
 test('lookup table addresses are resolved before account authorization', async () => {
   const f = fixture();

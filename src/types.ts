@@ -456,12 +456,12 @@ export interface CandidateTokenState {
   decision: DecisionAction;
   decisionReasons: string[];
   recentWallets: { address: string; category: WalletCategory; reputation: number }[];
-  entryStage?: 'OBSERVING' | 'ACCUMULATING' | 'CONFIRMED' | 'REJECTED' | 'EXPIRED';
+  entryStage?: import('./trading/earlyEntryEngine.ts').EntryStage;
   dataSource?: 'PUMPPORTAL';
   inspectedAt?: number;
   inspectionError?: string;
   curveVerified?: boolean;
-  entryMetrics?: { runupPct: number; uniqueBuyers: number; netFlowSol: number; buyShare: number; largestBuyerShare: number };
+  entryMetrics?: import('./trading/earlyEntryEngine.ts').EntryEvaluation;
   executionStatus?: 'NOT_SUBMITTED' | 'CHECKING_ROUTE' | 'CONFIRMED' | 'BLOCKED';
   executionError?: string;
   // Strictly separated 4-dimension audit metrics

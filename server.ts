@@ -639,6 +639,7 @@ app.post('/api/wallet/one-click-enroll', async (req, res) => {
     if (!tokenMint || !symbol || !sizeSol) {
       return res.status(400).json({ error: 'tokenMint, symbol, and sizeSol are required' });
     }
+    const signalGuard = coordinator.createSignalGuard(tokenMint);
     const result = await walletManager.oneClickEnroll({
       tokenMint,
       symbol,
@@ -647,7 +648,7 @@ app.post('/api/wallet/one-click-enroll', async (req, res) => {
       slippageBps: slippageBps ? Number(slippageBps) : undefined,
       priceSol: priceSol ? Number(priceSol) : undefined,
       priceUsd: priceUsd ? Number(priceUsd) : undefined,
-    });
+    }, signalGuard);
     if (!result.success) {
       return res.status(400).json(result);
     }

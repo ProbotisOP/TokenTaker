@@ -25,6 +25,7 @@ export interface FeedStatus {
 }
 
 interface FeedOptions {
+  disabledReason?: string;
   enabled: boolean;
   apiKey?: string;
   enableTrades: boolean;
@@ -55,14 +56,16 @@ export class LiveTokenFeedService {
 
   constructor(private options: FeedOptions) {
     this.status = {
-      state: 'DISABLED', tradeFlowEnabled: !!options.apiKey && options.enableTrades,
+      state: 'DISABLED', error: options.enabled ? undefined : options.disabledReason,
+      tradeFlowEnabled: !!options.apiKey && options.enableTrades,
       launchesReceived: 0, tradesReceived: 0, droppedEvents: 0, trackedTokens: 0,
     };
   }
 
   static getInstance(): LiveTokenFeedService {
     return this.instance ??= new LiveTokenFeedService({
-      enabled: process.env.EARLY_FEED_ENABLED === 'true',
+      disabledReason: 'No active market-data source. Phantom connects a wallet, not a launch feed. Non-Pump discovery and safety adapters are not implemented yet.',
+      enabled: process.env.EARLY_FEED_ENABLED === 'true' && process.env.EARLY_FEED_PROVIDER === 'PUMPPORTAL',
       apiKey: process.env.PUMPPORTAL_API_KEY,
       enableTrades: process.env.PUMPPORTAL_ENABLE_TRADES === 'true',
     });

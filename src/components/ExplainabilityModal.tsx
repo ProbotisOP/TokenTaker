@@ -25,6 +25,12 @@ export const ExplainabilityModal: React.FC<ExplainabilityModalProps> = ({ candid
     ['Observed net flow (10s)', `${(entryMetrics?.netFlowSol ?? 0).toFixed(3)} SOL`],
     ['Largest buyer share of buy volume', `${((entryMetrics?.largestBuyerShare ?? 0) * 100).toFixed(1)}%`],
     ['Run-up from launch observation', `${(entryMetrics?.runupPct ?? 0).toFixed(1)}%`],
+    ['Price extension over accumulation anchor', `${(entryMetrics?.anchorExtensionPct ?? 0).toFixed(1)}%`],
+    ['Price acceleration (5s halves)', `${(entryMetrics?.priceAccelerationPct ?? 0).toFixed(2)} pp`],
+    ['Volume acceleration (5s halves)', entryMetrics?.volumeAcceleration == null ? 'Unverified' : `${entryMetrics.volumeAcceleration.toFixed(2)}×`],
+    ['Verified holder change', entryMetrics?.holderGrowth == null ? 'Unverified' : String(entryMetrics.holderGrowth)],
+    ['Verified liquidity change', entryMetrics?.liquidityChangePct == null ? 'Unverified' : `${entryMetrics.liquidityChangePct.toFixed(1)}%`],
+    ['Entry structure', entryMetrics?.entryStyle?.replaceAll('_', ' ') ?? 'Observing'],
     ['Wallet profitability / common funding / wash networks', 'Unverified; distinct addresses can share an owner'],
     ['Expected return / win probability', 'Not calibrated; no forecast supplied'],
     ['Execution', candidate.executionStatus ?? 'NOT_SUBMITTED'],
@@ -39,7 +45,8 @@ export const ExplainabilityModal: React.FC<ExplainabilityModalProps> = ({ candid
         <div className="p-5 overflow-auto space-y-4 text-xs font-mono">
           <a className="text-cyan-300 break-all flex items-center gap-2" href={`https://solscan.io/token/${metadata.mint}`} target="_blank" rel="noreferrer">{metadata.mint}<ExternalLink className="w-3 h-3 shrink-0" /></a>
           <div className={`p-3 rounded border ${approved ? 'border-emerald-500/40 text-emerald-300' : 'border-amber-500/40 text-amber-200'}`}>
-            <strong>{approved ? 'ENTRY CONFIRMED, NOT A FILL OR PROFIT GUARANTEE' : candidate.decision}</strong>
+            <strong>{entryMetrics?.label ?? candidate.decision}</strong>
+            {approved && <p className="mt-1">Setup only. Not a fill, calibrated forecast, or profit guarantee.</p>}
             <ul className="list-disc list-inside mt-2 space-y-1">{candidate.decisionReasons.map(reason => <li key={reason}>{reason}</li>)}</ul>
           </div>
           <dl className="divide-y divide-zinc-800">{rows.map(([label, value]) => (

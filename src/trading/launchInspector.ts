@@ -13,6 +13,7 @@ export interface LaunchInspection {
   top1Pct: number;
   top5Pct: number;
   top10Pct: number;
+  holderCount?: number;
   creatorOwnershipPct: number;
   mintAuthorityRevoked: boolean;
   freezeAuthorityRevoked: boolean;
@@ -329,6 +330,7 @@ export class LaunchInspector {
       liquiditySol: Number(realSol) / 1e9,
       tokenProgram: TOKEN.toBase58(), decimals, supplyTokens: Number(supply) / 10 ** decimals,
       creator, top1Pct: top(1), top5Pct: top(5), top10Pct: top(10),
+      holderCount: missing === 0n ? [...owners.values()].filter(amount => amount > 0n).length : undefined,
       creatorOwnershipPct: pct(creatorAmount),
       mintAuthorityRevoked: mintInfo.mintAuthority === null,
       freezeAuthorityRevoked: mintInfo.freezeAuthority === null,
