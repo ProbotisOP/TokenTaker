@@ -16,6 +16,7 @@ import {
 import { CandidateTokenState, DecisionAction, RiskLevel } from '../types.ts';
 
 interface LiveScannerProps {
+  feedStatus?: { state: string; tradeFlowEnabled: boolean; error?: string; trackedTokens: number };
   candidates: CandidateTokenState[];
   onSelectCandidate: (candidate: CandidateTokenState) => void;
   onRealBuy?: (candidate: CandidateTokenState) => void;
@@ -23,6 +24,7 @@ interface LiveScannerProps {
 }
 
 export const LiveScanner: React.FC<LiveScannerProps> = ({
+  feedStatus,
   candidates,
   onSelectCandidate,
   onRealBuy,
@@ -43,6 +45,7 @@ export const LiveScanner: React.FC<LiveScannerProps> = ({
       setEnrollFeedback(null);
       try {
         const res = await onOneClickEnroll(c);
+        if (res && !res.success) throw new Error(res.error || 'Trade request rejected');
         if (res && res.success) {
           setEnrollFeedback({
             symbol: c.metadata.symbol,
@@ -70,7 +73,7 @@ export const LiveScanner: React.FC<LiveScannerProps> = ({
         return (
           <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[11px] font-mono font-bold bg-emerald-500/15 text-emerald-400 border border-emerald-500/30">
             <ShieldCheck className="w-3 h-3" />
-            SAFE ({score})
+            CHECKS PASS ({score})
           </span>
         );
       case RiskLevel.MEDIUM:
@@ -97,18 +100,19 @@ export const LiveScanner: React.FC<LiveScannerProps> = ({
     }
   };
 
-  const getDecisionBadge = (decision: DecisionAction) => {
+  const getDecisionBadge = (candidate: CandidateTokenState) => {
+    const decision = candidate.decision;
     if (decision === DecisionAction.BUY) {
       return (
         <span className="px-2 py-0.5 rounded text-[11px] font-mono font-bold bg-emerald-500 text-zinc-950 uppercase tracking-wider flex items-center gap-1">
           <Zap className="w-3 h-3 fill-current" />
-          APPROVED BUY
+          {candidate.entryMetrics?.label ?? 'BUY — CLEAN EARLY ENTRY'}
         </span>
       );
     }
     return (
       <span className="px-2 py-0.5 rounded text-[11px] font-mono font-semibold bg-zinc-800 text-zinc-400 border border-zinc-700">
-        REJECTED
+        {candidate.entryMetrics?.label ?? (decision === DecisionAction.WAIT ? 'WAIT — EARLY SETUP, NEED CONFIRMATION' : 'REJECTED')}
       </span>
     );
   };
@@ -124,27 +128,16 @@ export const LiveScanner: React.FC<LiveScannerProps> = ({
           </h2>
         </div>
         <div className="text-[11px] font-mono text-zinc-500 flex items-center gap-3">
-          <button
-            onClick={async () => {
-              try {
-                await fetch('/api/paper/trigger-launch', { method: 'POST' });
-              } catch (e) {
-                console.error(e);
-              }
-            }}
-            className="px-2 py-0.5 rounded text-[10px] font-mono font-bold bg-zinc-800 hover:bg-zinc-700 text-zinc-300 border border-zinc-700 transition flex items-center gap-1"
-            title="Ingest an incoming DEX launch immediately into the scanner"
-          >
-            <Zap className="w-3 h-3 text-amber-400" />
-            <span>+ Ingest Launch</span>
-          </button>
           <div className="flex items-center gap-1.5">
-            <span className="inline-block w-2 h-2 rounded-full bg-emerald-400 animate-ping" />
-            <span>Streaming DEX</span>
+            <span className={`inline-block w-2 h-2 rounded-full ${feedStatus?.state === 'CONNECTED' ? 'bg-emerald-400' : 'bg-amber-400'}`} />
+            <span>{feedStatus?.state ?? 'CONNECTING'} · {feedStatus?.tradeFlowEnabled ? 'trade feed configured' : 'discovery only'}</span>
           </div>
         </div>
       </div>
 
+      <div className="px-4 py-2 text-xs text-amber-200 bg-amber-950/20 border-b border-zinc-800">
+        {feedStatus?.error || (feedStatus?.state === 'DISABLED' ? 'Launch discovery is disabled. Manual swaps are available under Real Wallet / Phantom. Automated signals still need a configured market feed.' : 'Observed wallet flow is not verified smart money. Common funding and wash-trading networks remain unverified.')}
+      </div>
       {/* Enroll Feedback Notification */}
       {enrollFeedback && (
         <div className="mx-4 mt-3 p-3 rounded-lg bg-emerald-950/80 border border-emerald-500 text-xs font-mono flex items-center justify-between">
@@ -170,7 +163,7 @@ export const LiveScanner: React.FC<LiveScannerProps> = ({
       <div className="overflow-x-auto flex-1 max-h-[480px] divide-y divide-zinc-800/60">
         {candidates.length === 0 ? (
           <div className="p-8 text-center text-xs font-mono text-zinc-500">
-            Listening to Solana RPC and Pump.fun/Raydium event streams for incoming launches...
+            No fresh launch observations. Feed: {feedStatus?.state ?? 'connecting'}. No synthetic candidates are supplied.
           </div>
         ) : (
           candidates.map((c) => {
@@ -244,7 +237,7 @@ export const LiveScanner: React.FC<LiveScannerProps> = ({
                       {c.metadata.launchVenue}
                     </span>
                     {getRiskBadge(c.safety.riskLevel, c.safety.safetyScore)}
-                    {getDecisionBadge(c.decision)}
+                    {getDecisionBadge(c)}
                   </div>
 
                   {/* Micro attributes */}
@@ -252,35 +245,36 @@ export const LiveScanner: React.FC<LiveScannerProps> = ({
                     <span>
                       Pool Liq:{' '}
                       <strong className="text-zinc-200">
-                        {c.metadata.initialLiquiditySol.toFixed(1)} SOL
+                        {c.micro.liquiditySol.toFixed(1)} SOL
                       </strong>
                     </span>
                     <span>
-                      Alpha Score:{' '}
+                      Heuristic Score:{' '}
                       <strong className={c.opportunity.opportunityScore >= 75 ? 'text-cyan-400' : 'text-zinc-400'}>
                         {c.opportunity.opportunityScore}/100
                       </strong>
                     </span>
                     <span>
-                      Exp Return:{' '}
-                      <strong className="text-emerald-400">
-                        +{c.opportunity.expectedReturnPct}%
+                      Observed Run-up:{' '}
+                      <strong className="text-zinc-200">
+                        {c.entryMetrics?.runupPct.toFixed(1) ?? '0'}%
                       </strong>
                     </span>
                     <span>
                       Top 1:{' '}
                       <strong className={c.safety.top1Percent > 18 ? 'text-rose-400' : 'text-zinc-300'}>
-                        {c.safety.top1Percent.toFixed(1)}%
+                        {c.inspectionError || !c.inspectedAt ? 'unverified' : `${c.safety.top1Percent.toFixed(1)}%`}
                       </strong>
                     </span>
                     <span>
-                      LP Burned:{' '}
-                      <strong className={c.safety.lpBurnPct >= 85 ? 'text-emerald-400' : 'text-rose-400'}>
-                        {c.safety.lpBurnPct}%
+                      Curve custody:{' '}
+                      <strong className={c.curveVerified ? 'text-emerald-400' : 'text-amber-400'}>
+                        {c.curveVerified ? 'verified (no LP shares)' : 'unverified'}
                       </strong>
                     </span>
                   </div>
 
+                  {c.executionError && <div className="text-xs text-amber-300 mt-1">Execution blocked: {c.executionError}</div>}
                   {/* Reject Reasons or approval summary */}
                   {c.decisionReasons.length > 0 && (
                     <div className="mt-1.5 text-[11px] font-mono line-clamp-1">
@@ -302,26 +296,24 @@ export const LiveScanner: React.FC<LiveScannerProps> = ({
                 {/* Right: Latency Breakdown, 1-Click Buy & Inspect */}
                 <div className="flex items-center gap-3 sm:self-center shrink-0">
                   <div className="text-right font-mono">
-                    <div className="text-[11px] text-zinc-500">Pipeline Latency</div>
-                    <div className="text-xs font-bold text-cyan-400">{latencyMs}ms</div>
-                    <div className="text-[9px] text-zinc-600">
-                      det &rarr; parse &rarr; score &rarr; dec
-                    </div>
+                    <div className="text-[11px] text-zinc-500">Observed for</div>
+                    <div className="text-xs font-bold text-cyan-400">{(latencyMs / 1000).toFixed(1)}s</div>
+                    <div className="text-[9px] text-zinc-600">{c.entryStage?.replaceAll('_', ' ')}</div>
                   </div>
 
                   {/* ⚡ 1-Click Real Buy Button */}
                   <button
                     onClick={() => handle1ClickBuy(c)}
-                    disabled={isEnrolling}
+                    disabled={isEnrolling || !isApproved}
                     className="flex items-center gap-1.5 px-3 py-1.5 rounded bg-emerald-500 hover:bg-emerald-400 disabled:opacity-50 text-zinc-950 text-xs font-mono font-bold transition shadow-sm"
-                    title={`1-Click Buy $${c.metadata.symbol} on-chain with dedicated trading keypair`}
+                    title={`Review $${c.metadata.symbol} buy in Phantom; approval is required`}
                   >
                     {isEnrolling ? (
                       <Loader2 className="w-3.5 h-3.5 animate-spin" />
                     ) : (
                       <Zap className="w-3.5 h-3.5 fill-current" />
                     )}
-                    <span>⚡ 1-Click Real Buy</span>
+                    <span>Review buy in Phantom</span>
                   </button>
 
                   <button

@@ -36,14 +36,16 @@ export class ScoringEngine {
     const ratio = micro.buySellRatio;
     const buyPressure = Math.min(1.0, Math.max(0.0, ratio >= 1.0 ? 0.5 + Math.min(0.5, (ratio - 1.0) / 4.0) : ratio * 0.5));
 
-    // Volume Acceleration: 3s volume relative to 30s average per 3s
+    // Compare disjoint intervals: latest 3s versus the preceding 27s.
     const v3s = micro.windows['3s'].volumeSol;
-    const v30sAvg = micro.windows['30s'].volumeSol / 10.0;
-    const accelRatio = v30sAvg > 0 ? v3s / v30sAvg : 1.0;
+    const priorVolume = Math.max(0, micro.windows['30s'].volumeSol - v3s);
+    const priorTrades = micro.windows['30s'].tradeCount - micro.windows['3s'].tradeCount;
+    const prior3sAverage = priorVolume / 9;
+    const accelRatio = priorTrades > 0 && prior3sAverage > 0 ? v3s / prior3sAverage : 0;
     const volumeAcceleration = Math.min(1.0, Math.max(0.0, accelRatio / 3.0));
 
-    // Holder Growth: unique buyers in 30s
-    const holderGrowth = Math.min(1.0, Math.max(0.0, micro.uniqueBuyers / 25.0));
+    // Swap participants alone do not establish holder growth.
+    const holderGrowth = Math.min(1.0, Math.max(0.0, micro.holderGrowth / 25.0));
 
     // Wallet Quality: direct from WalletIntelligence (0 to 1)
     const walletQuality = Math.min(1.0, Math.max(0.0, walletQualityScore));

@@ -10,6 +10,7 @@ export interface ExitSignal {
   action: 'FULL_EXIT' | 'SCALE_OUT' | 'HOLD';
   pctToSell: number; // 0 to 100
   reason: string;
+  tierIndex?: number;
   isEmergency: boolean;
 }
 
@@ -72,8 +73,8 @@ export class ExitEngine {
     for (let i = 0; i < position.takeProfitLadder.length; i++) {
       const step = position.takeProfitLadder[i];
       if (!step.filled && currentPrice >= step.targetPriceSol) {
-        step.filled = true;
         return {
+          tierIndex: i,
           shouldExit: true,
           action: 'SCALE_OUT',
           pctToSell: step.pctToSell,
@@ -141,10 +142,11 @@ export class ExitEngine {
     newTrailingPriceSol: number;
     trailingActivated: boolean;
     peakPriceUsd: number;
+    peakPriceSol: number;
   } {
-    const solUsdRate = 155.0;
-    const currentPriceUsd = currentPriceSol * solUsdRate;
-    const peakPriceUsd = Math.max(position.peakPriceUsd || currentPriceUsd, currentPriceUsd);
+    const priorPeak = (position as Position & { peakPriceSol?: number }).peakPriceSol;
+    const peakPriceSol = Math.max(Number.isFinite(priorPeak) ? priorPeak! : position.entryPriceSol, currentPriceSol);
+    const peakPriceUsd = position.peakPriceUsd;
 
     const gainPct = ((currentPriceSol - position.entryPriceSol) / position.entryPriceSol) * 100;
     let trailingActivated = position.trailingActivated;
@@ -154,8 +156,7 @@ export class ExitEngine {
     if (gainPct >= 25.0) {
       trailingActivated = true;
       // Trail by 14% below highest recorded price
-      const peakSol = peakPriceUsd / solUsdRate;
-      const proposedTrailing = peakSol * 0.86;
+      const proposedTrailing = peakPriceSol * 0.86;
       newTrailingPriceSol = Math.max(newTrailingPriceSol, proposedTrailing);
     }
 
@@ -163,6 +164,7 @@ export class ExitEngine {
       newTrailingPriceSol,
       trailingActivated,
       peakPriceUsd,
+      peakPriceSol,
     };
   }
 }

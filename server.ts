@@ -2,6 +2,7 @@
  * Production-Grade Autonomous Solana Memecoin Trading System
  * Express Server & Vite Middleware Integration
  */
+import 'dotenv/config';
 import express from 'express';
 import path from 'path';
 import { createServer as createViteServer } from 'vite';
@@ -15,6 +16,8 @@ import { GrokBotEngine } from './src/trading/grokBotEngine.ts';
 import { WalletManager } from './src/trading/walletManager.ts';
 import { LivePreflightEngine } from './src/trading/livePreflightEngine.ts';
 import { SystemMode } from './src/types.ts';
+import { PhantomTradingService } from './src/trading/phantomTradingService.ts';
+import { JupiterService } from './src/trading/jupiterService.ts';
 
 const app = express();
 const PORT = 3000;
@@ -25,6 +28,39 @@ app.use(express.json());
 const coordinator = EngineCoordinator.getInstance();
 const grokBot = GrokBotEngine.getInstance();
 const walletManager = WalletManager.getInstance();
+const phantomTrading = new PhantomTradingService({ wallet: walletManager, coordinator });
+JupiterService.isSignatureSettled = signature => coordinator.hasSettledSignature(signature);
+JupiterService.dedicatedSigningGuard = context => {
+  if (context.action === 'SELL' && coordinator.activePositions.some(position => position.signingMethod === 'PHANTOM' &&
+      position.walletAddress === context.walletAddress && position.tokenMint === context.tokenMint && position.status === 'OPEN')) {
+    throw new Error('This position requires explicit Phantom approval; server-side signing is prohibited');
+  }
+};
+
+app.use((req, _res, next) => {
+  if (req.method === 'POST' && ['/api/wallet/connect', '/api/wallet/disconnect', '/api/wallet/setup-dedicated-keypair',
+    '/api/wallet/reset-dedicated-keypair', '/api/wallet/use-dedicated-as-active', '/api/mode'].includes(req.path)) {
+    phantomTrading.invalidateConnection();
+  }
+  if (req.method === 'POST' && req.path === '/api/wallet/config' && req.body?.updates &&
+      ['walletAddress', 'isConnected', 'network', 'rpcEndpoint', 'autotradeMode'].some(key => key in req.body.updates)) {
+    phantomTrading.invalidateConnection();
+  }
+  next();
+});
+
+for (const action of ['enable', 'prepare', 'submit', 'cancel'] as const) {
+  app.post(`/api/wallet/phantom/${action}`, async (req, res) => {
+    try {
+      const result = action === 'enable' ? phantomTrading.enable(req.body ?? {}) :
+        action === 'prepare' ? await phantomTrading.prepare(req.body ?? {}) :
+          action === 'submit' ? await phantomTrading.submit(req.body ?? {}) : phantomTrading.cancel(req.body?.approvalId);
+      res.status(result.success ? 200 : 409).json(result);
+    } catch (error) {
+      res.status(400).json({ success: false, error: error instanceof Error ? error.message : 'Phantom request rejected' });
+    }
+  });
+}
 
 // Lazy Gemini AI Client Initialization
 let aiClient: GoogleGenAI | null = null;
@@ -72,6 +108,7 @@ app.get('/api/state', (req, res) => {
     weights: coordinator.weights,
     activePositions: coordinator.activePositions,
     closedPositions: coordinator.closedPositions,
+    feedStatus: coordinator.getFeedStatus(),
     candidateTokens: coordinator.candidateTokens,
     tradeHistory: coordinator.tradeHistory,
     walletConfig: walletManager.getConfig(),
@@ -104,19 +141,22 @@ app.post('/api/mode', (req, res) => {
   }
 
   const result = coordinator.setMode(mode);
-  res.json(result);
+  res.status(result.success ? 200 : 403).json(result);
 });
 
 /**
  * Emergency Kill Switch Trigger
  */
-app.post('/api/emergency-stop', (req, res) => {
+app.post('/api/emergency-stop', async (req, res) => {
   const reason = req.body.reason || 'Operator triggered manual kill switch from dashboard';
-  coordinator.triggerEmergencyStop(reason);
-  res.json({
-    success: true,
-    message: 'EMERGENCY KILL SWITCH ACTIVATED. All positions closed. Circuit breaker locked.',
-  });
+  try {
+    await coordinator.triggerEmergencyStop(reason);
+    const remaining = coordinator.activePositions.filter(p => p.isRealWalletTrade).length;
+    res.json({ success: true, remainingPositions: remaining,
+      message: remaining ? 'New entries halted. Some exits failed or await reconciliation; positions remain monitored.' : 'New entries halted. No tracked live positions remain.' });
+  } catch {
+    res.status(503).json({ success: false, message: 'Entries halted; exit settlement could not be completed. Check open positions.' });
+  }
 });
 
 /**
@@ -327,13 +367,8 @@ app.post('/api/grok-bot/trigger', (req, res) => {
 /**
  * Trigger simulated incoming launch in main coordinator (paper trading)
  */
-app.post('/api/paper/trigger-launch', (req, res) => {
-  try {
-    (coordinator as any).simulateIncomingLaunch();
-    res.json({ success: true, message: 'Simulated launch ingested into coordinator' });
-  } catch (err: any) {
-    res.status(500).json({ error: err.message || 'Failed to trigger launch' });
-  }
+app.post('/api/paper/trigger-launch', (_req, res) => {
+  res.status(410).json({ error: 'Synthetic launch ingestion retired. Scanner accepts provider launch events only.' });
 });
 
 /**
@@ -397,10 +432,15 @@ app.post('/api/wallet/config', (req, res) => {
   }
 });
 
-app.post('/api/wallet/kill-switch', (req, res) => {
+app.post('/api/wallet/kill-switch', async (req, res) => {
   try {
     const { reason } = req.body;
-    const result = walletManager.triggerKillSwitch(reason || 'Operator triggered Emergency Kill Switch');
+    if (coordinator.activePositions.some(position => position.signingMethod === 'PHANTOM')) {
+      await coordinator.triggerEmergencyStop(reason || 'Operator triggered Emergency Kill Switch');
+      return res.json({ success: true, config: walletManager.getConfig(),
+        message: 'Buy execution stopped. Phantom positions remain open and require individual exit approvals.' });
+    }
+    const result = await walletManager.triggerKillSwitch(reason || 'Operator triggered Emergency Kill Switch');
     res.json(result);
   } catch (err: any) {
     res.status(500).json({ error: err.message });
@@ -409,7 +449,13 @@ app.post('/api/wallet/kill-switch', (req, res) => {
 
 app.post('/api/wallet/reset-kill-switch', (req, res) => {
   try {
+    if (walletManager.getPendingExecutions().length) return res.status(409).json({ error: 'Reconcile unresolved executions before resetting the kill switch' });
     const result = walletManager.resetKillSwitch();
+    coordinator.riskLimits.circuitBreakerActive = false;
+    coordinator.riskLimits.circuitBreakerReason = undefined;
+    coordinator.recalculatePortfolio();
+    coordinator.setMode(SystemMode.SHADOW);
+    coordinator.persistState();
     res.json(result);
   } catch (err: any) {
     res.status(500).json({ error: err.message });
@@ -559,9 +605,9 @@ app.post('/api/wallet/devnet-airdrop', async (req, res) => {
 /**
  * Flatten / Liquidate ALL active real wallet trades
  */
-app.post('/api/wallet/flatten-all-real', (req, res) => {
+app.post('/api/wallet/flatten-all-real', async (req, res) => {
   try {
-    const result = walletManager.flattenAllRealTrades();
+    const result = await walletManager.flattenAllRealTrades();
     res.json(result);
   } catch (err: any) {
     res.status(500).json({ error: err.message });
@@ -633,6 +679,7 @@ app.post('/api/wallet/one-click-enroll', async (req, res) => {
     if (!tokenMint || !symbol || !sizeSol) {
       return res.status(400).json({ error: 'tokenMint, symbol, and sizeSol are required' });
     }
+    const signalGuard = coordinator.createSignalGuard(tokenMint);
     const result = await walletManager.oneClickEnroll({
       tokenMint,
       symbol,
@@ -641,7 +688,7 @@ app.post('/api/wallet/one-click-enroll', async (req, res) => {
       slippageBps: slippageBps ? Number(slippageBps) : undefined,
       priceSol: priceSol ? Number(priceSol) : undefined,
       priceUsd: priceUsd ? Number(priceUsd) : undefined,
-    });
+    }, signalGuard);
     if (!result.success) {
       return res.status(400).json(result);
     }

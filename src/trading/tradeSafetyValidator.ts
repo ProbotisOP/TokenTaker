@@ -7,6 +7,7 @@
  * 
  * ZERO TOLERANCE for ambiguous conversions or unverified accounts.
  */
+import { requireAttestedSwap } from './swapAttestation.ts';
 import { Connection, PublicKey, VersionedTransaction } from '@solana/web3.js';
 import {
   SOL_MINT_ADDRESS,
@@ -58,7 +59,7 @@ export interface SafeDiagnosticTradeRecord {
 export class TradeSafetyValidator {
   public static readonly DEFAULT_MAX_PRICE_IMPACT_PCT = 2.5; // 2.5% max price impact
   public static readonly MAX_QUOTE_AGE_MS = 15_000; // 15 seconds freshness ceiling
-  public static readonly INPUT_TOLERANCE_PCT = 0.01; // 1% input amount deviation tolerance
+  public static readonly INPUT_TOLERANCE_PCT = 0; // ExactIn must match the intended base units.
 
   /**
    * Validates a Jupiter quote prior to transaction construction.
@@ -95,8 +96,29 @@ export class TradeSafetyValidator {
     const output_mint = quote_response.outputMint;
     const quote_in_amount_str = quote_response.inAmount;
     const quote_out_amount_str = quote_response.outAmount;
-    const min_out_str = quote_response.otherAmountThreshold || quote_out_amount_str;
-    const price_impact_pct = Number(quote_response.priceImpactPct || 0);
+    const min_out_str = quote_response.otherAmountThreshold;
+    const price_impact_pct = Number(quote_response.priceImpactPct);
+    for (const amount of [quote_in_amount_str, quote_out_amount_str, min_out_str]) {
+      if (typeof amount !== 'string' || !/^(0|[1-9][0-9]*)$/.test(amount)) {
+        throw new Error('TRADE_REJECTED: MALFORMED_JUPITER_QUOTE');
+      }
+    }
+    if (!['BUY', 'SELL'].includes(intended_action) ||
+        !Number.isFinite(price_impact_pct) || price_impact_pct < 0 ||
+        !['string', 'number'].includes(typeof quote_response.priceImpactPct) ||
+        String(quote_response.priceImpactPct).trim() === '' ||
+        !Number.isFinite(max_price_impact_pct) || max_price_impact_pct < 0 ||
+        !Number.isInteger(max_slippage_bps) || max_slippage_bps < 0 || max_slippage_bps > 5000 ||
+        (quote_response.slippageBps !== undefined && (!Number.isInteger(quote_response.slippageBps) ||
+          quote_response.slippageBps < 0 || quote_response.slippageBps > max_slippage_bps)) ||
+        (quote_response.swapMode !== undefined && quote_response.swapMode !== 'ExactIn') ||
+        (quote_response.routePlan !== undefined && !Array.isArray(quote_response.routePlan))) {
+      throw new Error('TRADE_REJECTED: INVALID_QUOTE_RISK_PARAMETERS');
+    }
+    const quoteTime = quote_response.fetchedAt ?? quote_response.timestamp;
+    if (quoteTime !== undefined && (!Number.isFinite(quoteTime) || quoteTime > now || now - quoteTime > this.MAX_QUOTE_AGE_MS)) {
+      throw new Error('TRADE_REJECTED: STALE_QUOTE');
+    }
 
     // 2. Mint Verification
     if (intended_action === 'BUY') {
@@ -126,26 +148,9 @@ export class TradeSafetyValidator {
 
     // 4. Input Amount Tolerance Check
     const quote_in_amount_bi = BigInt(quote_in_amount_str);
-    if (intended_action === 'BUY' && intended_sol_lamports !== undefined) {
-      const diff = quote_in_amount_bi > intended_sol_lamports
-        ? quote_in_amount_bi - intended_sol_lamports
-        : intended_sol_lamports - quote_in_amount_bi;
-      const max_allowed_diff = (intended_sol_lamports * 1n) / 100n; // 1% tolerance
-      if (diff > max_allowed_diff) {
-        throw new Error(
-          `TRADE_REJECTED: INPUT_AMOUNT_MISMATCH (Intended ${intended_sol_lamports} lamports, quote has ${quote_in_amount_bi} lamports)`
-        );
-      }
-    } else if (intended_action === 'SELL' && intended_token_base_units !== undefined) {
-      const diff = quote_in_amount_bi > intended_token_base_units
-        ? quote_in_amount_bi - intended_token_base_units
-        : intended_token_base_units - quote_in_amount_bi;
-      const max_allowed_diff = (intended_token_base_units * 1n) / 100n;
-      if (diff > max_allowed_diff) {
-        throw new Error(
-          `TRADE_REJECTED: INPUT_AMOUNT_MISMATCH (Intended ${intended_token_base_units} base units, quote has ${quote_in_amount_bi})`
-        );
-      }
+    const intendedAmount = intended_action === 'BUY' ? intended_sol_lamports : intended_token_base_units;
+    if (typeof intendedAmount !== 'bigint' || intendedAmount <= 0n || quote_in_amount_bi !== intendedAmount) {
+      throw new Error('TRADE_REJECTED: INPUT_AMOUNT_MISMATCH');
     }
 
     // 5. Output Amount Safety Threshold
@@ -173,6 +178,11 @@ export class TradeSafetyValidator {
       if (quote_out_amount_bi < 10_000n) {
         throw new Error(`TRADE_REJECTED: OUTPUT_AMOUNT_BELOW_SAFETY_THRESHOLD (Received tiny output ${quote_out_amount_bi} lamports)`);
       }
+    }
+
+    const minimumAllowed = quote_out_amount_bi * BigInt(10000 - max_slippage_bps) / 10000n;
+    if (min_out_bi > quote_out_amount_bi || min_out_bi < minimumAllowed) {
+      throw new Error('TRADE_REJECTED: INVALID_MINIMUM_OUTPUT_SLIPPAGE');
     }
 
     // 6. Excessive Price Impact Check
@@ -240,8 +250,9 @@ export class TradeSafetyValidator {
     const signer_indexes = versioned_tx.message.header.numRequiredSignatures;
     const signers = account_keys.slice(0, signer_indexes);
 
-    if (!signers.includes(wallet_pubkey)) {
+    if (signer_indexes !== 1 || account_keys[0] !== wallet_pubkey || !signers.includes(wallet_pubkey)) {
       throw new Error(`TRADE_REJECTED: INVALID_TRANSACTION_SIGNER (Signers [${signers.join(', ')}] missing wallet ${wallet_pubkey})`);
     }
+    requireAttestedSwap(versioned_tx, { action: params.intended_action, tokenMint: params.intended_token_mint, walletAddress: wallet_pubkey });
   }
 }

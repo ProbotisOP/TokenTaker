@@ -59,7 +59,9 @@ export class ExecutionEngine {
     // Total expected round-trip execution drag
     const totalDragPct = baseSlippagePct + ((jitoTipSol + networkFeeSol) / sizeSol) * 100;
     const netExpectedEdgePct = expectedEdgePct - totalDragPct;
-    const justifiesEdge = netExpectedEdgePct > 3.0 && baseSlippagePct <= slippageLimitPct;
+    const valid = [poolLiquiditySol, sizeSol, expectedPriceSol, expectedEdgePct, slippageLimitPct].every(Number.isFinite)
+      && poolLiquiditySol > 0 && sizeSol > 0 && expectedPriceSol > 0 && slippageLimitPct >= 0;
+    const justifiesEdge = valid && netExpectedEdgePct > 3.0 && baseSlippagePct <= slippageLimitPct;
 
     const solUsdRate = 155.0;
 
@@ -87,9 +89,9 @@ export class ExecutionEngine {
     const submitted_at = Date.now();
     const preCheck = this.preCheck(request);
 
-    if (!preCheck.justifiesEdge && !isLiveMode) {
+    if (isLiveMode || !preCheck.justifiesEdge) {
       return {
-        txSignature: 'FAILED_PRECHECK',
+        txSignature: undefined,
         status: TradeStatus.REJECTED,
         sizeTokens: 0,
         actualPriceSol: request.expectedPriceSol,
@@ -108,7 +110,7 @@ export class ExecutionEngine {
           detection_to_decision_ms: request.decision_at - request.detected_at,
           execution_flight_ms: 0,
         },
-        errorMessage: preCheck.simulationError,
+        errorMessage: isLiveMode ? 'LIVE execution requires the guarded asynchronous wallet executor' : preCheck.simulationError,
       };
     }
 

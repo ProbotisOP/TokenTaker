@@ -50,6 +50,7 @@ export const ActivePositions: React.FC<ActivePositionsProps> = ({
     try {
       if (onOneClickExit) {
         const res = await onOneClickExit(positionId, pct);
+        if (res && !res.success) throw new Error(res.error || 'Exit request rejected');
         if (res && res.success) {
           setExitFeedback({
             positionId,
@@ -159,7 +160,7 @@ export const ActivePositions: React.FC<ActivePositionsProps> = ({
               </div>
               <div className="font-bold text-zinc-300 text-sm">No Completed Trades Yet</div>
               <p className="text-[11px] text-zinc-400 max-w-md mx-auto leading-relaxed">
-                When an on-chain position is closed manually with <strong>1-Click Exit</strong> or via Stop Loss / Take Profit targets, its complete audit receipt, return breakdown, and Solscan transactions will be saved here permanently.
+                After a confirmed exit, the fill and return breakdown are saved in local accounting. Phantom positions require your approval for every sell, including stop-loss and take-profit recommendations.
               </p>
             </div>
           ) : (
@@ -256,7 +257,7 @@ export const ActivePositions: React.FC<ActivePositionsProps> = ({
                         <span>&rarr;</span>
                         <span>Returned: <strong className="text-emerald-300 font-bold">{returnedSol.toFixed(4)} SOL</strong></span>
                         <span className="px-1.5 py-0.5 rounded text-[10px] bg-emerald-950/60 text-emerald-300 border border-emerald-800/60 font-semibold">
-                          Deposited to Phantom
+                          Returned to signing wallet
                         </span>
                       </div>
                     </div>
@@ -313,7 +314,7 @@ export const ActivePositions: React.FC<ActivePositionsProps> = ({
             </div>
             <div className="font-bold text-zinc-300 text-sm">No Active On-Chain Positions</div>
             <p className="text-[11px] text-zinc-400 max-w-md mx-auto leading-relaxed">
-              Your Solana wallet balance is fully liquid and held safely. Use <strong>⚡ 1-Click Real Buy</strong> in the Scanner to instantly enroll into detected memecoins on-chain.
+              No tracked open positions. Open <strong>Real Wallet / Phantom</strong> to review a manual swap, or review an eligible scanner signal. Every Phantom trade needs your approval.
             </p>
             {closedPositions.length > 0 && (
               <div className="pt-2">
@@ -456,7 +457,7 @@ export const ActivePositions: React.FC<ActivePositionsProps> = ({
                         ) : (
                           <Zap className="w-3.5 h-3.5 fill-current" />
                         )}
-                        <span>⚡ 1-Click Exit 100%</span>
+                        <span>{p.signingMethod === 'PHANTOM' ? 'Review full sell in Phantom' : 'Exit 100%'}</span>
                       </button>
 
                       {/* ⚡ Scale Out 50% */}

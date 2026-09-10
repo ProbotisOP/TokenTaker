@@ -68,12 +68,12 @@ export const Header: React.FC<HeaderProps> = ({
                 Solana Quant
               </h1>
               <span className="text-[11px] font-mono px-1.5 py-0.5 rounded bg-zinc-800 text-zinc-400 border border-zinc-700">
-                v2.4.0-PROD
+                Early-entry research
               </span>
             </div>
             <p className="text-xs text-zinc-400 font-mono flex items-center gap-1.5">
               <Radio className="w-3 h-3 text-emerald-400 animate-pulse" />
-              Low-Latency Event Stream &bull; Jito MEV Shield Active
+              Observed launches &bull; Confirmation before execution
             </p>
           </div>
         </div>
@@ -83,11 +83,8 @@ export const Header: React.FC<HeaderProps> = ({
           {/* Latency KPI */}
           <div className="hidden sm:flex items-center gap-1.5 px-3 py-1.5 rounded-md bg-zinc-900/90 border border-zinc-800 text-zinc-300">
             <Clock className="w-3.5 h-3.5 text-cyan-400" />
-            <span className="text-zinc-500">Latency:</span>
-            <span className="text-cyan-300 font-semibold">44ms</span>
-            <span className="text-zinc-600">|</span>
-            <span className="text-zinc-500">Flight:</span>
-            <span className="text-zinc-300">142ms</span>
+            <span className="text-zinc-500">Execution latency:</span>
+            <span className="text-zinc-300">not measured</span>
           </div>
 
           {/* Hot Wallet Vault */}
@@ -162,8 +159,8 @@ export const Header: React.FC<HeaderProps> = ({
               <h2 className="text-lg font-bold text-zinc-100">CONFIRM EMERGENCY KILL SWITCH</h2>
             </div>
             <p className="text-xs text-zinc-300 leading-relaxed mb-4">
-              This action will <strong>immediately close all active positions at current market price</strong>,
-              cancel all pending transactions, lock the circuit breaker, and halt the autonomous scanner.
+              This action will <strong>halt new entries and attempt on-chain exits</strong>.
+              Already-broadcast transactions cannot be canceled. Failed or uncertain exits remain open for reconciliation; fills and prices are not guaranteed.
             </p>
             <div className="flex items-center justify-end gap-3">
               <button
@@ -199,9 +196,9 @@ export const Header: React.FC<HeaderProps> = ({
               spending limits are enforced, and statistical edge has survived Out-Of-Sample validation.
             </p>
             <div className="bg-zinc-950 p-3 rounded border border-zinc-800 text-[11px] font-mono text-zinc-400 mb-4">
-              &bull; Spending Limit: {config.hotWalletSpendingLimitSol} SOL Max<br />
-              &bull; Priority Fee: {config.priorityFeeMicroLamports} &mu;Lamports/CU<br />
-              &bull; Strict Stop Losses Enabled
+              &bull; Server live interlock, wallet preflight and authorization required<br />
+              &bull; Position sizing and route/fee checks run before signing<br />
+              &bull; Stops can fail to fill. Profitability has not been established.
             </div>
             <div className="flex items-center justify-end gap-3">
               <button

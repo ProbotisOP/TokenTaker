@@ -1,7 +1,3 @@
-/**
- * Market Microstructure & Flow Engine
- * Models early-launch order flow across ultra-short time horizons (1s, 3s, 5s, 10s, 30s, 60s).
- */
 import { LiveMarketMicrostructure, MicroWindowStats } from '../types.ts';
 
 export interface SwapTick {
@@ -15,131 +11,110 @@ export interface SwapTick {
   isNewWallet: boolean;
 }
 
+type PriceMark = { timestamp: number; priceSol: number; priceUsd: number };
+type LiquidityMark = { timestamp: number; liquiditySol: number };
+
 export class MicrostructureEngine {
   private ticks: SwapTick[] = [];
-  private initialPoolLiquiditySol: number;
-  private currentLiquiditySol: number;
-  private currentPriceSol: number;
-  private currentPriceUsd: number;
-  private solUsdRate: number = 155.0;
+  private prices: PriceMark[] = [];
+  private liquidity: LiquidityMark[] = [];
 
-  constructor(initialLiquiditySol: number, initialPriceSol: number) {
-    this.initialPoolLiquiditySol = initialLiquiditySol;
-    this.currentLiquiditySol = initialLiquiditySol;
-    this.currentPriceSol = initialPriceSol;
-    this.currentPriceUsd = initialPriceSol * this.solUsdRate;
-  }
-
-  public recordTick(tick: SwapTick): void {
-    this.ticks.push(tick);
-    this.currentPriceSol = tick.priceSol;
-    this.currentPriceUsd = tick.priceUsd;
-    if (tick.isBuy) {
-      this.currentLiquiditySol += tick.solAmount;
-    } else {
-      this.currentLiquiditySol = Math.max(0.1, this.currentLiquiditySol - tick.solAmount);
+  constructor(private initialLiquiditySol: number, private initialPriceSol: number) {
+    if (![initialLiquiditySol, initialPriceSol].every(v => Number.isFinite(v) && v >= 0)) {
+      throw new Error('Invalid initial market values');
     }
   }
 
-  public getSnapshot(nowTimestamp: number = Date.now()): LiveMarketMicrostructure {
-    const w1s = this.computeWindowStats(nowTimestamp, 1000);
-    const w3s = this.computeWindowStats(nowTimestamp, 3000);
-    const w5s = this.computeWindowStats(nowTimestamp, 5000);
-    const w10s = this.computeWindowStats(nowTimestamp, 10000);
-    const w30s = this.computeWindowStats(nowTimestamp, 30000);
-    const w60s = this.computeWindowStats(nowTimestamp, 60000);
+  private insert<T extends { timestamp: number }>(items: T[], value: T): void {
+    let lo = 0;
+    let hi = items.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >>> 1;
+      if (items[mid].timestamp <= value.timestamp) lo = mid + 1;
+      else hi = mid;
+    }
+    items.splice(lo, 0, value);
+    if (items.length > 10_000) items.splice(0, items.length - 10_000);
+  }
 
-    const totalBuys = this.ticks.filter(t => t.isBuy).reduce((sum, t) => sum + t.solAmount, 0);
-    const totalSells = this.ticks.filter(t => !t.isBuy).reduce((sum, t) => sum + t.solAmount, 0);
-    const totalVolume = totalBuys + totalSells;
-    const buySellRatio = totalSells > 0 ? totalBuys / totalSells : (totalBuys > 0 ? 10.0 : 1.0);
+  public recordTick(tick: SwapTick): void {
+    if (![tick.timestamp, tick.tokenAmount, tick.solAmount, tick.priceSol, tick.priceUsd]
+      .every(v => Number.isFinite(v) && v >= 0) || tick.priceSol === 0 || tick.solAmount === 0 || tick.tokenAmount === 0) return;
+    this.insert(this.ticks, { ...tick });
+    this.insert(this.prices, { timestamp: tick.timestamp, priceSol: tick.priceSol, priceUsd: tick.priceUsd });
+  }
 
-    const uniqueBuyers = new Set(this.ticks.filter(t => t.isBuy).map(t => t.traderWallet)).size;
-    const uniqueSellers = new Set(this.ticks.filter(t => !t.isBuy).map(t => t.traderWallet)).size;
-    const newWalletsCount = this.ticks.filter(t => t.isBuy && t.isNewWallet).length;
-    const totalBuyTrades = this.ticks.filter(t => t.isBuy).length;
-    const newWalletRate = totalBuyTrades > 0 ? newWalletsCount / totalBuyTrades : 0;
+  public updateMarket(market: { priceSol: number; priceUsd: number; liquiditySol: number }, timestamp = Date.now()): void {
+    if (![timestamp, market.priceSol, market.priceUsd, market.liquiditySol]
+      .every(v => Number.isFinite(v) && v >= 0) || market.priceSol === 0) return;
+    this.insert(this.prices, { timestamp, priceSol: market.priceSol, priceUsd: market.priceUsd });
+    this.insert(this.liquidity, { timestamp, liquiditySol: market.liquiditySol });
+  }
 
-    // Price velocity: % change per second over last 5 seconds
-    const priceVelocity = w5s.priceChangePct / 5.0;
-    // Volume velocity: SOL per second over last 5 seconds
-    const volumeVelocity = w5s.volumeSol / 5.0;
+  private pruneMarks<T extends { timestamp: number }>(marks: T[], cutoff: number): T[] {
+    const preceding = marks.filter(m => m.timestamp <= cutoff).slice(-1);
+    return preceding.concat(marks.filter(m => m.timestamp > cutoff));
+  }
 
-    // Liquidity change relative to creation
-    const liquidityChangePct = ((this.currentLiquiditySol - this.initialPoolLiquiditySol) / this.initialPoolLiquiditySol) * 100;
-
-    // Large transactions (>= 1.5 SOL)
-    const largeWalletActivityCount = this.ticks.filter(t => t.solAmount >= 1.5).length;
-
-    // Approximate circulating market cap in USD
-    const totalTokens = 1_000_000_000; // 1 billion standard SPL meme supply
-    const marketCapUsd = totalTokens * this.currentPriceUsd;
-
+  public getSnapshot(nowTimestamp = Date.now()): LiveMarketMicrostructure {
+    if (!Number.isFinite(nowTimestamp)) throw new Error('Invalid snapshot timestamp');
+    const cutoff = nowTimestamp - 60000;
+    this.ticks = this.ticks.filter(t => t.timestamp > cutoff);
+    // Keep one preceding mark so a quiet boundary still has a causal return baseline.
+    this.prices = this.pruneMarks(this.prices, cutoff);
+    this.liquidity = this.pruneMarks(this.liquidity, cutoff);
+    const active = this.ticks.filter(t => t.timestamp <= nowTimestamp);
+    const price = this.prices.filter(p => p.timestamp <= nowTimestamp).at(-1);
+    const priceSol = price?.priceSol ?? this.initialPriceSol;
+    const priceUsd = price?.priceUsd ?? 0;
+    const liquiditySol = this.liquidity.filter(p => p.timestamp <= nowTimestamp).at(-1)?.liquiditySol ?? this.initialLiquiditySol;
+    const solUsd = priceSol > 0 ? priceUsd / priceSol : 0;
+    const windows = {
+      '1s': this.computeWindowStats(nowTimestamp, 1000),
+      '3s': this.computeWindowStats(nowTimestamp, 3000),
+      '5s': this.computeWindowStats(nowTimestamp, 5000),
+      '10s': this.computeWindowStats(nowTimestamp, 10000),
+      '30s': this.computeWindowStats(nowTimestamp, 30000),
+      '60s': this.computeWindowStats(nowTimestamp, 60000),
+    };
+    const buys = active.filter(t => t.isBuy);
+    const summary = windows['60s'];
     return {
-      priceUsd: this.currentPriceUsd,
-      priceSol: this.currentPriceSol,
-      volumeSol: totalVolume,
-      buyVolumeSol: totalBuys,
-      sellVolumeSol: totalSells,
-      buySellRatio,
-      liquiditySol: this.currentLiquiditySol,
-      liquidityUsd: this.currentLiquiditySol * this.solUsdRate,
-      marketCapUsd,
-      priceVelocity,
-      volumeVelocity,
-      uniqueBuyers,
-      uniqueSellers,
-      newWalletRate,
-      holderGrowth: uniqueBuyers,
-      liquidityChangePct,
-      largeWalletActivityCount,
-      windows: {
-        '1s': w1s,
-        '3s': w3s,
-        '5s': w5s,
-        '10s': w10s,
-        '30s': w30s,
-        '60s': w60s,
-      },
+      priceUsd, priceSol,
+      volumeSol: summary.volumeSol,
+      buyVolumeSol: summary.buyVolumeSol,
+      sellVolumeSol: summary.sellVolumeSol,
+      buySellRatio: summary.buySellRatio,
+      liquiditySol, liquidityUsd: liquiditySol * solUsd,
+      marketCapUsd: 0, // Supply is not established by swap observations.
+      priceVelocity: windows['5s'].priceChangePct / 5,
+      volumeVelocity: windows['5s'].volumeSol / 5,
+      uniqueBuyers: summary.uniqueBuyers,
+      uniqueSellers: summary.uniqueSellers,
+      newWalletRate: buys.length ? buys.filter(t => t.isNewWallet).length / buys.length : 0,
+      holderGrowth: 0,
+      liquidityChangePct: this.initialLiquiditySol > 0 ? (liquiditySol / this.initialLiquiditySol - 1) * 100 : 0,
+      largeWalletActivityCount: active.filter(t => t.solAmount >= 1.5).length,
+      windows,
     };
   }
 
   private computeWindowStats(now: number, windowMs: number): MicroWindowStats {
     const cutoff = now - windowMs;
-    const recent = this.ticks.filter(t => t.timestamp >= cutoff);
-
-    if (recent.length === 0) {
-      return {
-        priceChangePct: 0,
-        volumeSol: 0,
-        buyVolumeSol: 0,
-        sellVolumeSol: 0,
-        buySellRatio: 1.0,
-        tradeCount: 0,
-        uniqueBuyers: 0,
-        uniqueSellers: 0,
-        netFlowSol: 0,
-      };
-    }
-
+    const recent = this.ticks.filter(t => t.timestamp > cutoff && t.timestamp <= now);
     const buyVolume = recent.filter(t => t.isBuy).reduce((sum, t) => sum + t.solAmount, 0);
     const sellVolume = recent.filter(t => !t.isBuy).reduce((sum, t) => sum + t.solAmount, 0);
-    const firstPrice = recent[0].priceSol;
-    const lastPrice = recent[recent.length - 1].priceSol;
-    const priceChangePct = firstPrice > 0 ? ((lastPrice - firstPrice) / firstPrice) * 100 : 0;
-    const buySellRatio = sellVolume > 0 ? buyVolume / sellVolume : (buyVolume > 0 ? 5.0 : 1.0);
-    const uniqueBuyers = new Set(recent.filter(t => t.isBuy).map(t => t.traderWallet)).size;
-    const uniqueSellers = new Set(recent.filter(t => !t.isBuy).map(t => t.traderWallet)).size;
-
+    const baseline = this.prices.filter(p => p.timestamp <= cutoff).at(-1);
+    const latest = this.prices.filter(p => p.timestamp <= now).at(-1);
     return {
-      priceChangePct,
+      priceChangePct: baseline && latest ? (latest.priceSol / baseline.priceSol - 1) * 100 : 0,
       volumeSol: buyVolume + sellVolume,
       buyVolumeSol: buyVolume,
       sellVolumeSol: sellVolume,
-      buySellRatio,
+      buySellRatio: sellVolume > 0 ? buyVolume / sellVolume : (buyVolume > 0 ? 5 : 1),
       tradeCount: recent.length,
-      uniqueBuyers,
-      uniqueSellers,
+      uniqueBuyers: new Set(recent.filter(t => t.isBuy && t.traderWallet).map(t => t.traderWallet)).size,
+      uniqueSellers: new Set(recent.filter(t => !t.isBuy && t.traderWallet).map(t => t.traderWallet)).size,
       netFlowSol: buyVolume - sellVolume,
     };
   }

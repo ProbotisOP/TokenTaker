@@ -47,12 +47,13 @@ import {
 } from '../types.ts';
 import { DedicatedKeypairModal } from './DedicatedKeypairModal.tsx';
 import { LivePreflightCenter } from './LivePreflightCenter.tsx';
+import { PhantomTradePanel } from './PhantomTradePanel.tsx';
 
 interface WalletAutotradeStudioProps {
   onNotify?: (msg: string) => void;
 }
 
-export const WalletAutotradeStudio: React.FC<WalletAutotradeStudioProps> = () => {
+const DedicatedWalletControls: React.FC<WalletAutotradeStudioProps> = () => {
   const [config, setConfig] = useState<WalletAutotradeConfig | null>(null);
   const [solUsdPrice, setSolUsdPrice] = useState<number>(170.0);
   const [activePositionsCount, setActivePositionsCount] = useState<number>(0);
@@ -3126,4 +3127,17 @@ export const WalletAutotradeStudio: React.FC<WalletAutotradeStudioProps> = () =>
       />
     </div>
   );
+};
+
+export const WalletAutotradeStudio: React.FC<WalletAutotradeStudioProps> = () => {
+  const [showDedicated, setShowDedicated] = useState(false);
+  return <div className="space-y-6 pb-12">
+    <PhantomTradePanel />
+    <div className="rounded-lg border border-zinc-800 p-4">
+      <button className="text-sm text-zinc-400 underline" onClick={() => setShowDedicated(value => !value)}>
+        {showDedicated ? 'Hide' : 'Show'} advanced dedicated-signer controls (not needed for Phantom)
+      </button>
+      {showDedicated && <div className="mt-4"><DedicatedWalletControls /></div>}
+    </div>
+  </div>;
 };

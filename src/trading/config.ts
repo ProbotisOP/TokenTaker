@@ -40,17 +40,17 @@ export const DEFAULT_STRATEGY_WEIGHTS: StrategyWeights = {
 };
 
 export const DEFAULT_SYSTEM_CONFIG: SystemConfig = {
-  mode: SystemMode.LIVE,
+  mode: SystemMode.SHADOW,
   rpcEndpoint: 'https://api.mainnet-beta.solana.com',
-  rpcBackupEndpoint: 'https://solana-mainnet.g.alchemy.com/v2/demo',
+  rpcBackupEndpoint: 'https://api.mainnet-beta.solana.com',
   wsEndpoint: 'wss://api.mainnet-beta.solana.com',
-  hotWalletPublicKey: '4xKj8...SolQuantHotVault',
+  hotWalletPublicKey: '',
   hotWalletSpendingLimitSol: 10.0,
   jitoTipFloorSol: 0.001,
   priorityFeeMicroLamports: 150000, // 150k microLamports per CU
   minSafetyScore: 80, // strict 80+ safety score required
   minOpportunityScore: 65, // 65+ opportunity score required (empirically calibrated positive edge)
-  minLiquiditySol: 8.0,
+  minLiquiditySol: 3.0,
   maxInitialLiquiditySol: 250.0,
   simulationModeOnly: false,
 };

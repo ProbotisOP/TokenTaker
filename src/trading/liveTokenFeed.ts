@@ -1,308 +1,192 @@
-/**
- * Real-Time Solana Meme Coin Discovery & Telemetry Feed
- * Replaces all mock/simulated tokens with 100% REAL Solana mainnet tokens,
- * real contract addresses, live DexScreener prices, pool depths, and DEX venues.
- */
-import { LaunchVenue } from '../types.ts';
+import { PublicKey } from '@solana/web3.js';
+import type { SwapTick } from './microstructureEngine.ts';
 
-export interface RealTokenPairData {
+export interface LaunchEvent {
   mint: string;
   symbol: string;
   name: string;
-  priceUsd: number;
-  priceSol: number;
-  liquiditySol: number;
-  liquidityUsd: number;
-  volume24h: number;
-  priceChange24h: number;
-  priceChange1h: number;
-  priceChange5m: number;
-  dexId: string;
-  url: string;
-  icon?: string;
-  txns24h?: { buys: number; sells: number };
+  creator: string;
+  poolAddress: string;
+  signature: string;
+  detectedAt: number;
+  initialPriceSol: number;
+  unsupportedMode: boolean;
 }
 
-// Top verified established Solana meme coins as reliable anchors
-export const VERIFIED_SOLANA_MEMES: RealTokenPairData[] = [
-  {
-    mint: 'DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263',
-    symbol: 'BONK',
-    name: 'Bonk',
-    priceUsd: 0.000028,
-    priceSol: 0.00000018,
-    liquiditySol: 18500,
-    liquidityUsd: 2800000,
-    volume24h: 32000000,
-    priceChange24h: 4.8,
-    priceChange1h: 0.9,
-    priceChange5m: 0.2,
-    dexId: 'raydium',
-    url: 'https://dexscreener.com/solana/dezxaz8z7pnrnrjjz3wborgixca6xjnb7yab1ppb263',
-  },
-  {
-    mint: 'EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm',
-    symbol: 'WIF',
-    name: 'dogwifhat',
-    priceUsd: 1.85,
-    priceSol: 0.0118,
-    liquiditySol: 24000,
-    liquidityUsd: 3800000,
-    volume24h: 68000000,
-    priceChange24h: 7.2,
-    priceChange1h: 1.4,
-    priceChange5m: 0.5,
-    dexId: 'raydium',
-    url: 'https://dexscreener.com/solana/ekpqgsjtjmfqkz9kqansqyxbopzlhyxdm65zcjm',
-  },
-  {
-    mint: '7GCihgDB8fe6KNjn2MYtkzZcRjQy3t9GHdC8uHYmW2hr',
-    symbol: 'POPCAT',
-    name: 'Popcat',
-    priceUsd: 0.88,
-    priceSol: 0.0056,
-    liquiditySol: 14200,
-    liquidityUsd: 2200000,
-    volume24h: 18000000,
-    priceChange24h: -2.1,
-    priceChange1h: 0.3,
-    priceChange5m: 0.1,
-    dexId: 'raydium',
-    url: 'https://dexscreener.com/solana/7gcihgdb8fe6knjn2mytkzzcrjqy3t9ghdc8uhymw2hr',
-  },
-  {
-    mint: 'MEW1gQWJ3nEXg2qgERiKu7FAFj79PHvQVREQUzScPP5',
-    symbol: 'MEW',
-    name: 'cat in a dogs world',
-    priceUsd: 0.0062,
-    priceSol: 0.000039,
-    liquiditySol: 9800,
-    liquidityUsd: 1550000,
-    volume24h: 12000000,
-    priceChange24h: 3.5,
-    priceChange1h: -0.2,
-    priceChange5m: 0.1,
-    dexId: 'raydium',
-    url: 'https://dexscreener.com/solana/mew1gqwj3nexg2qgeriku7fafj79phvqvrequzscpp5',
-  },
-  {
-    mint: 'ukHH6c7mMyPWCf1b9pnWe25TSpkDDt3H5pQZgZ74J82',
-    symbol: 'BOME',
-    name: 'BOOK OF MEME',
-    priceUsd: 0.0084,
-    priceSol: 0.000054,
-    liquiditySol: 11200,
-    liquidityUsd: 1750000,
-    volume24h: 15000000,
-    priceChange24h: 1.8,
-    priceChange1h: 0.4,
-    priceChange5m: -0.1,
-    dexId: 'raydium',
-    url: 'https://dexscreener.com/solana/ukhh6c7mmypwcf1b9pnwe25tspkddt3h5pqzgz74j82',
-  },
-];
+export interface FeedStatus {
+  state: 'DISABLED' | 'CONNECTING' | 'CONNECTED' | 'RECONNECTING' | 'ERROR';
+  tradeFlowEnabled: boolean;
+  lastMessageAt?: number;
+  launchesReceived: number;
+  tradesReceived: number;
+  droppedEvents: number;
+  trackedTokens: number;
+  error?: string;
+}
 
+interface FeedOptions {
+  disabledReason?: string;
+  enabled: boolean;
+  apiKey?: string;
+  enableTrades: boolean;
+  maxTrackedTokens?: number;
+  maxAgeMs?: number;
+}
+
+const validAddress = (value: unknown): value is string => {
+  if (typeof value !== 'string') return false;
+  try { return new PublicKey(value).toBase58() === value; } catch { return false; }
+};
+const positive = (value: unknown): value is number => typeof value === 'number' && Number.isFinite(value) && value > 0;
+
+/** One connection, bounded subscriptions, no token-list polling or synthetic fallbacks. */
 export class LiveTokenFeedService {
   private static instance: LiveTokenFeedService;
-  private tokenCache: Map<string, RealTokenPairData> = new Map();
-  private isFetching: boolean = false;
-  private tokenQueue: RealTokenPairData[] = [];
+  private socket?: WebSocket;
+  private reconnectTimer?: NodeJS.Timeout;
+  private expiryTimer?: NodeJS.Timeout;
+  private stopped = true;
+  private retries = 0;
+  private tokens = new Map<string, LaunchEvent>();
+  private signatures = new Set<string>();
+  private launchListeners: ((launch: LaunchEvent) => void)[] = [];
+  private tradeListeners: ((mint: string, tick: SwapTick) => void)[] = [];
+  private gapListeners: ((reason: string) => void)[] = [];
+  private status: FeedStatus;
 
-  private constructor() {
-    // Seed verified real tokens immediately into cache
-    for (const token of VERIFIED_SOLANA_MEMES) {
-      this.tokenCache.set(token.mint, token);
-      this.tokenQueue.push(token);
-    }
-
-    // Trigger initial fetch of fresh real Solana memecoins
-    this.refreshRealSolanaTokens().catch((err) => {
-      console.warn('[LiveTokenFeed] Initial DexScreener fetch warning:', err);
-    });
-
-    // Continuously poll DexScreener every 20 seconds for fresh Solana launches and boosts
-    setInterval(() => {
-      this.refreshRealSolanaTokens().catch(() => {});
-    }, 20000);
-  }
-
-  public static getInstance(): LiveTokenFeedService {
-    if (!LiveTokenFeedService.instance) {
-      LiveTokenFeedService.instance = new LiveTokenFeedService();
-    }
-    return LiveTokenFeedService.instance;
-  }
-
-  /**
-   * Fetches latest Solana token profiles and boosts from DexScreener
-   */
-  public async refreshRealSolanaTokens(): Promise<RealTokenPairData[]> {
-    if (this.isFetching) return Array.from(this.tokenCache.values());
-    this.isFetching = true;
-
-    try {
-      // 1. Fetch latest Solana token profiles and latest token boosts concurrently
-      const [profilesRes, boostsRes] = await Promise.all([
-        fetch('https://api.dexscreener.com/token-profiles/latest/v1').catch(() => null),
-        fetch('https://api.dexscreener.com/token-boosts/latest/v1').catch(() => null),
-      ]);
-
-      const solanaMints = new Set<string>();
-
-      if (profilesRes && profilesRes.ok) {
-        const profilesData = await profilesRes.json();
-        if (Array.isArray(profilesData)) {
-          profilesData
-            .filter((p: any) => p.chainId === 'solana' && p.tokenAddress)
-            .slice(0, 15)
-            .forEach((p: any) => solanaMints.add(p.tokenAddress));
-        }
-      }
-
-      if (boostsRes && boostsRes.ok) {
-        const boostsData = await boostsRes.json();
-        if (Array.isArray(boostsData)) {
-          boostsData
-            .filter((b: any) => b.chainId === 'solana' && b.tokenAddress)
-            .slice(0, 15)
-            .forEach((b: any) => solanaMints.add(b.tokenAddress));
-        }
-      }
-
-      // If no fresh mints returned (e.g. rate limit), keep existing cache
-      if (solanaMints.size === 0) {
-        return Array.from(this.tokenCache.values());
-      }
-
-      // 2. Fetch live price, liquidity, and DEX venue from DexScreener pairs API
-      const mintsToFetch = Array.from(solanaMints).slice(0, 25);
-      const pairsRes = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${mintsToFetch.join(',')}`);
-
-      if (pairsRes.ok) {
-        const pairsData = await pairsRes.json();
-        const pairs = pairsData.pairs || [];
-
-        for (const pair of pairs) {
-          if (pair.chainId !== 'solana' || !pair.baseToken?.address) continue;
-
-          const mint = pair.baseToken.address;
-          const symbol = pair.baseToken.symbol || 'MEME';
-          const name = pair.baseToken.name || symbol;
-          const priceUsd = Number(pair.priceUsd || 0);
-          const priceSol = Number(pair.priceNative || (priceUsd > 0 ? priceUsd / 160 : 0.0001));
-          const liquiditySol = Number(pair.liquidity?.quote || (pair.liquidity?.usd ? pair.liquidity.usd / 160 : 15.0));
-          const liquidityUsd = Number(pair.liquidity?.usd || liquiditySol * 160);
-          const volume24h = Number(pair.volume?.h24 || 0);
-          const priceChange24h = Number(pair.priceChange?.h24 || 0);
-          const priceChange1h = Number(pair.priceChange?.h1 || 0);
-          const priceChange5m = Number(pair.priceChange?.m5 || 0);
-
-          const tokenData: RealTokenPairData = {
-            mint,
-            symbol: symbol.toUpperCase().slice(0, 10),
-            name: name.slice(0, 30),
-            priceUsd,
-            priceSol,
-            liquiditySol,
-            liquidityUsd,
-            volume24h,
-            priceChange24h,
-            priceChange1h,
-            priceChange5m,
-            dexId: pair.dexId || 'raydium',
-            url: pair.url || `https://dexscreener.com/solana/${mint}`,
-            icon: pair.info?.imageUrl,
-            txns24h: pair.txns?.h24,
-          };
-
-          this.tokenCache.set(mint, tokenData);
-
-          // Add to rotational queue if not already in queue
-          if (!this.tokenQueue.some((t) => t.mint === mint)) {
-            this.tokenQueue.unshift(tokenData);
-          }
-        }
-      }
-
-      return Array.from(this.tokenCache.values());
-    } catch (err) {
-      console.warn('[LiveTokenFeed] Error fetching DexScreener data:', err);
-      return Array.from(this.tokenCache.values());
-    } finally {
-      this.isFetching = false;
-    }
-  }
-
-  /**
-   * Retrieves the next real Solana token from the live queue
-   */
-  public getNextRealToken(): RealTokenPairData {
-    if (this.tokenQueue.length === 0) {
-      const cached = Array.from(this.tokenCache.values());
-      this.tokenQueue = cached.length > 0 ? [...cached] : [...VERIFIED_SOLANA_MEMES];
-    }
-    const token = this.tokenQueue.shift() || VERIFIED_SOLANA_MEMES[0];
-    this.tokenQueue.push(token);
-    return token;
-  }
-
-  /**
-   * Converts a real DexScreener token into an EngineCoordinator ingest payload
-   */
-  public toIngestPayload(token: RealTokenPairData): {
-    mint: string;
-    name: string;
-    symbol: string;
-    creator: string;
-    venue: LaunchVenue;
-    initialLiquiditySol: number;
-    initialPriceSol: number;
-    hasMintAuth: boolean;
-    hasFreezeAuth: boolean;
-    lpBurnPct: number;
-    top1Pct: number;
-    top10Pct: number;
-    creatorOwnershipPct: number;
-    insiderBundles: number;
-    washTrading: boolean;
-    creatorDumpRisk: boolean;
-  } {
-    let venue = LaunchVenue.RAYDIUM_AMM_V4;
-    const lowerDex = (token.dexId || '').toLowerCase();
-    const lowerMint = (token.mint || '').toLowerCase();
-
-    if (lowerDex === 'pumpfun' || lowerDex === 'pumpswap' || lowerMint.endsWith('pump')) {
-      venue = LaunchVenue.PUMPFUN;
-    } else if (lowerDex === 'meteora') {
-      venue = LaunchVenue.METEORA_DLMM;
-    } else if (lowerDex === 'raydium_cpmm') {
-      venue = LaunchVenue.RAYDIUM_CPMM;
-    }
-
-    const isPumpFun = venue === LaunchVenue.PUMPFUN;
-    const hasHealthyLiquidity = token.liquiditySol >= 10.0;
-
-    return {
-      mint: token.mint,
-      name: token.name,
-      symbol: token.symbol,
-      creator: `Deployer_${token.mint.slice(0, 4)}...${token.mint.slice(-4)}`,
-      venue,
-      initialLiquiditySol: Math.max(2.5, token.liquiditySol),
-      initialPriceSol: Math.max(0.00000001, token.priceSol),
-      hasMintAuth: false,
-      hasFreezeAuth: false,
-      lpBurnPct: isPumpFun || hasHealthyLiquidity ? 100 : 85,
-      top1Pct: Math.max(3.5, Math.min(18.0, 7.5 + (token.priceChange24h > 20 ? 4 : 0))),
-      top10Pct: Math.max(18.0, Math.min(48.0, 28.5 + (token.priceChange24h > 50 ? 8 : 0))),
-      creatorOwnershipPct: Math.max(0.5, Math.min(4.5, 1.8)),
-      insiderBundles: token.priceChange5m > 30 ? 2 : 0,
-      washTrading: false,
-      creatorDumpRisk: false,
+  constructor(private options: FeedOptions) {
+    this.status = {
+      state: 'DISABLED', error: options.enabled ? undefined : options.disabledReason,
+      tradeFlowEnabled: !!options.apiKey && options.enableTrades,
+      launchesReceived: 0, tradesReceived: 0, droppedEvents: 0, trackedTokens: 0,
     };
   }
 
-  public getAllRealTokens(): RealTokenPairData[] {
-    return Array.from(this.tokenCache.values());
+  static getInstance(): LiveTokenFeedService {
+    return this.instance ??= new LiveTokenFeedService({
+      disabledReason: 'Launch discovery is disabled. Manual swaps are available under Real Wallet / Phantom. Automated signals still need a configured market feed.',
+      enabled: process.env.EARLY_FEED_ENABLED === 'true' && process.env.EARLY_FEED_PROVIDER === 'PUMPPORTAL',
+      apiKey: process.env.PUMPPORTAL_API_KEY,
+      enableTrades: process.env.PUMPPORTAL_ENABLE_TRADES === 'true',
+    });
+  }
+
+  onLaunch(listener: (launch: LaunchEvent) => void): void { this.launchListeners.push(listener); }
+  onTrade(listener: (mint: string, tick: SwapTick) => void): void { this.tradeListeners.push(listener); }
+  onGap(listener: (reason: string) => void): void { this.gapListeners.push(listener); }
+  getStatus(): FeedStatus { return { ...this.status, trackedTokens: this.tokens.size }; }
+
+  start(): void {
+    if (!this.stopped || !this.options.enabled) return;
+    this.stopped = false;
+    this.connect();
+    this.expiryTimer = setInterval(() => this.expire(Date.now()), 1000);
+    this.expiryTimer.unref();
+  }
+
+  stop(): void {
+    this.stopped = true;
+    clearTimeout(this.reconnectTimer);
+    clearInterval(this.expiryTimer);
+    this.socket?.close();
+    this.status.state = 'DISABLED';
+  }
+
+  private connect(): void {
+    this.status.state = this.retries ? 'RECONNECTING' : 'CONNECTING';
+    const endpoint = new URL('wss://pumpportal.fun/api/data');
+    if (this.options.apiKey) endpoint.searchParams.set('api-key', this.options.apiKey);
+    const ws = this.socket = new WebSocket(endpoint);
+    const connectTimeout = setTimeout(() => ws.close(), 10_000);
+    ws.onopen = () => {
+      clearTimeout(connectTimeout);
+      this.retries = 0;
+      this.status.state = 'CONNECTED';
+      this.status.error = this.status.tradeFlowEnabled ? undefined : 'Discovery only: funded API key and explicit metered trade opt-in required for signals';
+      ws.send(JSON.stringify({ method: 'subscribeNewToken' }));
+    };
+    ws.onmessage = event => {
+      try { this.acceptMessage(JSON.parse(String(event.data))); }
+      catch { this.status.droppedEvents++; }
+    };
+    ws.onerror = () => { this.status.error = 'Launch stream connection failed'; };
+    ws.onclose = () => {
+      clearTimeout(connectTimeout);
+      if (this.stopped) return;
+      this.status.state = 'RECONNECTING';
+      this.status.error = 'Stream gap: existing candidates invalidated; waiting for new launches';
+      this.gapListeners.forEach(listener => listener(this.status.error!));
+      this.tokens.clear();
+      const delay = Math.min(30_000, 1000 * 2 ** this.retries++);
+      this.reconnectTimer = setTimeout(() => this.connect(), delay);
+      this.reconnectTimer.unref();
+    };
+  }
+
+  // Public for deterministic provider-fixture replay. Only the socket invokes this in production.
+  acceptMessage(data: any, now = Date.now()): void {
+    this.status.lastMessageAt = now;
+    if (data?.errors || data?.error) {
+      this.status.state = 'ERROR';
+      this.status.error = 'Provider rejected subscription or data request';
+      this.gapListeners.forEach(listener => listener(this.status.error!));
+      return;
+    }
+    if (!data || !['create', 'buy', 'sell'].includes(data.txType)) return;
+    if (!validAddress(data.mint) || !validAddress(data.traderPublicKey) ||
+        typeof data.signature !== 'string' || !/^[1-9A-HJ-NP-Za-km-z]{64,88}$/.test(data.signature)) {
+      this.status.droppedEvents++; return;
+    }
+    const key = `${data.signature}:${data.mint}:${data.txType}`;
+    if (this.signatures.has(key)) return;
+    this.signatures.add(key);
+    if (this.signatures.size > 20_000) this.signatures.delete(this.signatures.values().next().value!);
+    this.expire(now);
+    if (data.txType === 'create') {
+      if (this.tokens.has(data.mint)) return;
+      if (!validAddress(data.bondingCurveKey) || !positive(data.vSolInBondingCurve) || !positive(data.vTokensInBondingCurve)) {
+        this.status.droppedEvents++; return;
+      }
+      if (this.tokens.size >= (this.options.maxTrackedTokens ?? 100)) {
+        // Keep observing existing candidates rather than resetting their confirmation windows under load.
+        this.status.droppedEvents++; return;
+      }
+      const launch: LaunchEvent = {
+        mint: data.mint, name: String(data.name || '').slice(0, 80), symbol: String(data.symbol || '').slice(0, 16),
+        creator: data.traderPublicKey, signature: data.signature, poolAddress: data.bondingCurveKey,
+        detectedAt: now, initialPriceSol: data.vSolInBondingCurve / data.vTokensInBondingCurve,
+        unsupportedMode: data.is_mayhem_mode === true || (data.pool !== undefined && data.pool !== 'pump'),
+      };
+      this.tokens.set(launch.mint, launch);
+      this.status.launchesReceived++;
+      if (this.status.tradeFlowEnabled) this.send({ method: 'subscribeTokenTrade', keys: [launch.mint] });
+      this.launchListeners.forEach(listener => listener(launch));
+      return;
+    }
+    if (!this.tokens.has(data.mint) || !positive(data.solAmount) || !positive(data.tokenAmount)) return;
+    if (data.pool && data.pool !== 'pump') {
+      this.gapListeners.forEach(listener => listener('Unsupported pool migration observed; reinspection required'));
+      return;
+    }
+    const price = positive(data.vSolInBondingCurve) && positive(data.vTokensInBondingCurve)
+      ? data.vSolInBondingCurve / data.vTokensInBondingCurve : data.solAmount / data.tokenAmount;
+    if (!positive(price)) return;
+    this.status.tradesReceived++;
+    this.tradeListeners.forEach(listener => listener(data.mint, {
+      timestamp: now, isBuy: data.txType === 'buy', solAmount: data.solAmount, tokenAmount: data.tokenAmount,
+      priceSol: price, priceUsd: 0, traderWallet: data.traderPublicKey, isNewWallet: false,
+    }));
+  }
+
+  private send(payload: object): void {
+    if (this.socket?.readyState === WebSocket.OPEN) this.socket.send(JSON.stringify(payload));
+  }
+
+  private expire(now: number): void {
+    const expired: string[] = [];
+    for (const [mint, launch] of this.tokens) {
+      if (now - launch.detectedAt > (this.options.maxAgeMs ?? 120_000)) { expired.push(mint); this.tokens.delete(mint); }
+    }
+    if (expired.length && this.status.tradeFlowEnabled) this.send({ method: 'unsubscribeTokenTrade', keys: expired });
   }
 }
