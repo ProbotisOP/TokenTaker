@@ -13,6 +13,7 @@ import {
   HelpCircle,
 } from 'lucide-react';
 import { CandidateTokenState, WalletAutotradeConfig } from '../types.ts';
+import { VersionedTransaction } from '@solana/web3.js';
 
 interface RealTradeOrderModalProps {
   isOpen: boolean;
@@ -108,7 +109,7 @@ export const RealTradeOrderModal: React.FC<RealTradeOrderModalProps> = ({
   const estimatedTokens = Math.floor(tradeSizeSol / Math.max(0.000001, priceSol));
   const maxAvailableToTrade = Math.max(0, balanceSol - gasReserveSol);
 
-  // Quick connect to Phantom or Sandbox
+  // Quick connect to Phantom
   const handleConnectPhantom = async () => {
     setIsConnecting(true);
     setErrorMessage(null);
@@ -133,8 +134,7 @@ export const RealTradeOrderModal: React.FC<RealTradeOrderModalProps> = ({
           return;
         }
       }
-      // If extension not detected in iframe, link pre-funded sandbox wallet
-      await handleConnectSandbox();
+      setErrorMessage('Phantom extension not detected. Please install Phantom at phantom.app to trade with your real wallet.');
     } catch (err: any) {
       setErrorMessage('Phantom connection error: ' + (err.message || err));
     } finally {
@@ -142,29 +142,7 @@ export const RealTradeOrderModal: React.FC<RealTradeOrderModalProps> = ({
     }
   };
 
-  const handleConnectSandbox = async () => {
-    setIsConnecting(true);
-    setErrorMessage(null);
-    try {
-      const res = await fetch('/api/wallet/connect', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          address: '9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin',
-          walletName: 'Sandbox Wallet (0.12 SOL Pre-Funded)',
-          network: 'mainnet-beta',
-        }),
-      });
-      const data = await res.json();
-      if (data.config) setLocalConfig(data.config);
-    } catch (err: any) {
-      setErrorMessage('Sandbox connect failed: ' + err.message);
-    } finally {
-      setIsConnecting(false);
-    }
-  };
-
-  // Execute real trade
+  // Execute trade (Real Phantom on-chain or Paper)
   const handleExecuteTrade = async (autoRaiseLimit: boolean = false) => {
     if (!tokenMint) {
       setErrorMessage('Token mint address is required.');
@@ -186,6 +164,43 @@ export const RealTradeOrderModal: React.FC<RealTradeOrderModalProps> = ({
     setExecutionResult(null);
 
     try {
+      const anyWindow = window as any;
+      const provider = anyWindow.phantom?.solana || anyWindow.solana;
+      let realTxSignature: string | undefined = undefined;
+
+      // If Phantom wallet is connected, perform REAL on-chain swap via Phantom extension
+      if (isConnected && provider?.isPhantom && provider.publicKey) {
+        // 1. Fetch real Jupiter swap transaction from backend
+        const buyRes = await fetch('/api/swap/buy-tx', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            tokenMint,
+            sizeSol: tradeSizeSol,
+            userPublicKey: provider.publicKey.toString(),
+            slippageBps: Math.round((localConfig?.maxSlippagePct || 2.0) * 100),
+          }),
+        });
+
+        const buyData = await buyRes.json();
+        if (!buyRes.ok || !buyData.swapTransaction) {
+          throw new Error(buyData.error || 'Failed to generate real DEX swap transaction');
+        }
+
+        // 2. Deserialize VersionedTransaction and sign with Phantom
+        const binaryStr = atob(buyData.swapTransaction);
+        const bytes = new Uint8Array(binaryStr.length);
+        for (let i = 0; i < binaryStr.length; i++) {
+          bytes[i] = binaryStr.charCodeAt(i);
+        }
+        const vTx = VersionedTransaction.deserialize(bytes);
+
+        // 3. User approves in Phantom popup -> Real on-chain broadcast
+        const sendResult = await provider.signAndSendTransaction(vTx);
+        realTxSignature = sendResult.signature;
+      }
+
+      // 4. Register position in system
       const res = await fetch('/api/wallet/execute-signal-trade', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -200,6 +215,7 @@ export const RealTradeOrderModal: React.FC<RealTradeOrderModalProps> = ({
           recommendedSizeSol: tradeSizeSol,
           autoRaiseLimit,
           overrideMaxPositions: autoRaiseLimit,
+          realTxSignature,
         }),
       });
 
@@ -212,10 +228,10 @@ export const RealTradeOrderModal: React.FC<RealTradeOrderModalProps> = ({
         const stateData = await stateRes.json();
         if (stateData.config) setLocalConfig(stateData.config);
       } else {
-        setErrorMessage(data.error || 'Trade execution failed on Solana RPC');
+        setErrorMessage(data.error || 'Trade execution failed');
       }
     } catch (err: any) {
-      setErrorMessage('Network or execution error: ' + (err.message || err));
+      setErrorMessage('Execution error: ' + (err.message || err));
     } finally {
       setIsExecuting(false);
     }
@@ -326,14 +342,6 @@ export const RealTradeOrderModal: React.FC<RealTradeOrderModalProps> = ({
                 >
                   <Zap className="w-3 h-3 fill-current" />
                   <span>{isConnecting ? 'Connecting...' : 'Connect Phantom'}</span>
-                </button>
-                <button
-                  onClick={handleConnectSandbox}
-                  disabled={isConnecting}
-                  className="px-2.5 py-1.5 rounded bg-zinc-800 hover:bg-zinc-700 text-zinc-300 transition text-[10px]"
-                  title="Use 0.12 SOL pre-funded sandbox test wallet"
-                >
-                  Sandbox (0.12 SOL)
                 </button>
               </div>
             )}

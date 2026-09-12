@@ -184,11 +184,6 @@ export class ExecutionEngine {
   }
 
   private static generateSimulatedTxSignature(): string {
-    const chars = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
-    let sig = '';
-    for (let i = 0; i < 88; i++) {
-      sig += chars.charAt(Math.floor(Math.random() * chars.length));
-    }
-    return sig.slice(0, 16) + '...' + sig.slice(-8);
+    return 'PAPER_SIM_' + Math.random().toString(36).substring(2, 9);
   }
 }

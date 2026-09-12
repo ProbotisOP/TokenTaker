@@ -238,13 +238,7 @@ export class WalletManager {
 
       return { balanceSol: sol, balanceUsd: usd };
     } catch (err) {
-      // Fallback for demo / preview if public RPC is rate-limited: preserve prior or seed nominal amount
-      if (this.config.balanceSol === 0 && this.config.walletAddress) {
-        this.config.balanceSol = 0.12;
-        this.config.balanceUsd = Number((0.12 * SOL_USD_ESTIMATE).toFixed(2));
-        this.config.allocatedCapitalSol = 0.09;
-        this.config.allocatedCapitalUsd = Number((0.09 * SOL_USD_ESTIMATE).toFixed(2));
-      }
+      console.warn(`[WalletManager] Error checking balance for ${this.config.walletAddress}:`, err);
       return { balanceSol: this.config.balanceSol, balanceUsd: this.config.balanceUsd };
     }
   }
@@ -334,7 +328,7 @@ export class WalletManager {
   public executeTradeExit(
     positionId: string,
     action: 'FLATTEN_100' | 'SCALE_OUT_50' | 'BREAKEVEN_SL' | 'CUSTOM_SL_TP',
-    params?: { customStopLossPct?: number; customTakeProfitPct?: number }
+    params?: { customStopLossPct?: number; customTakeProfitPct?: number; realTxSignature?: string }
   ): { success: boolean; message: string; position?: any } {
     const grokBot = GrokBotEngine.getInstance();
     const grokState = grokBot.getState();
@@ -393,6 +387,13 @@ export class WalletManager {
         coordPos.closedAt = Date.now();
         coordPos.realizedPnlSol = coordPos.unrealizedPnlSol;
         coordPos.exitReason = 'MANUAL_DASHBOARD_100_FLATTEN';
+        if (params?.realTxSignature) {
+          coordPos.exitTxSignature = params.realTxSignature;
+          coordPos.exitSolscanUrl = `https://solscan.io/tx/${params.realTxSignature}`;
+        } else if (!coordPos.isRealWalletTrade) {
+          coordPos.exitTxSignature = 'PAPER_SIMULATED';
+          coordPos.exitSolscanUrl = undefined;
+        }
         coordinator.portfolio.cashSol += coordPos.currentValueSol;
         coordinator.portfolio.dailyRealizedPnlSol += coordPos.realizedPnlSol;
         coordinator.portfolio.totalRealizedPnlSol += coordPos.realizedPnlSol;
@@ -417,13 +418,15 @@ export class WalletManager {
         coordinator.portfolio.dailyRealizedPnlSol += realizedPnl;
         coordinator.portfolio.totalRealizedPnlSol += realizedPnl;
 
+        const scaleSig = params?.realTxSignature || (coordPos.isRealWalletTrade ? undefined : 'PAPER_SIMULATED');
+
         coordPos.executionHistory.push({
           action: 'SCALE_OUT',
           priceSol: coordPos.currentPriceSol,
           tokens: halfTokens,
           pnlSol: realizedPnl,
           timestamp: Date.now(),
-          txSignature: `4xScale50_${Math.random().toString(36).substring(2, 7)}`,
+          txSignature: scaleSig,
         });
 
         return {
@@ -729,20 +732,19 @@ export class WalletManager {
     const slippagePct = Math.min(this.config.maxSlippagePct, 1.4);
     const priorityFeeSol = 0.00035;
 
-    // Generate transaction signature
-    const chars = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
-    let txSig = '';
-    for (let i = 0; i < 88; i++) {
-      txSig += chars.charAt(Math.floor(Math.random() * chars.length));
-    }
-    const explorerUrl = this.config.network === 'devnet'
-      ? `https://solscan.io/tx/${txSig}?cluster=devnet`
-      : `https://solscan.io/tx/${txSig}`;
+    // Real vs Paper attribution (No fake tx signatures)
+    const isRealTrade = Boolean(request.realTxSignature);
+    const txSig = request.realTxSignature || undefined;
+    const explorerUrl = txSig
+      ? (this.config.network === 'devnet'
+        ? `https://solscan.io/tx/${txSig}?cluster=devnet`
+        : `https://solscan.io/tx/${txSig}`)
+      : undefined;
 
     const posId = `POS_${request.symbol}_${Date.now()}`;
     const ladder = ExitEngine.createLadder(priceSol);
 
-    // 1. Create position in EngineCoordinator with explicit Real Wallet attribution
+    // 1. Create position in EngineCoordinator with explicit attribution
     const position: Position = {
       id: posId,
       tokenMint: request.tokenMint,
@@ -770,9 +772,13 @@ export class WalletManager {
       trailingStopPriceSol: ladder.trailingStopPriceSol,
       trailingActivated: false,
       status: 'OPEN',
-      isRealWalletTrade: true,
-      walletAddress: this.config.walletAddress || undefined,
+      isRealWalletTrade: isRealTrade,
+      executionType: isRealTrade ? 'LIVE_ON_CHAIN' : 'PAPER_SIMULATED',
+      isSimulated: !isRealTrade,
+      simulationBadgeText: isRealTrade ? undefined : 'PAPER',
+      walletAddress: isRealTrade ? (this.config.walletAddress || undefined) : undefined,
       executionVenue: this.config.network === 'devnet' ? 'Solana Devnet AMM' : 'Solana Mainnet (Raydium AMM / Pump.fun)',
+      solscanUrl: explorerUrl,
       executionHistory: [
         {
           action: 'ENTRY',
@@ -790,6 +796,7 @@ export class WalletManager {
     coordinator.recalculatePortfolio();
 
     // 2. Also register in GrokBot state for live visual execution tracking
+    const grokBot = GrokBotEngine.getInstance();
     grokBot.getState().activePositions.unshift({
       id: posId,
       symbol: request.symbol,

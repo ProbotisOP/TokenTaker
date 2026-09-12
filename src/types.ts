@@ -260,8 +260,15 @@ export interface Position {
   closedAt?: number;
   exitReason?: string;
   isRealWalletTrade?: boolean;
+  executionType?: 'LIVE_ON_CHAIN' | 'PAPER_SIMULATED';
+  isSimulated?: boolean;
+  simulationBadgeText?: string;
   walletAddress?: string;
   executionVenue?: string;
+  txSignature?: string;
+  solscanUrl?: string;
+  exitTxSignature?: string;
+  exitSolscanUrl?: string;
   executionHistory: {
     action: 'ENTRY' | 'SCALE_OUT' | 'STOP' | 'EMERGENCY';
     priceSol: number;
@@ -857,6 +864,8 @@ export interface SignalTradeTriggerRequest {
   recommendedSizeSol?: number;
   overrideMaxPositions?: boolean;
   autoRaiseLimit?: boolean;
+  realTxSignature?: string;
+  isPaperTrade?: boolean;
 }
 
 export interface SignalTradeResult {

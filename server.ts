@@ -13,6 +13,7 @@ import { CounterfactualEngine } from './src/trading/counterfactualEngine.ts';
 import { ParameterTuner } from './src/trading/parameterTuner.ts';
 import { GrokBotEngine } from './src/trading/grokBotEngine.ts';
 import { WalletManager } from './src/trading/walletManager.ts';
+import { PhantomSwapService } from './src/trading/phantomSwapService.ts';
 import { SystemMode } from './src/types.ts';
 
 const app = express();
@@ -316,12 +317,12 @@ app.post('/api/grok-bot/trigger', (req, res) => {
 /**
  * Trigger simulated incoming launch in main coordinator (paper trading)
  */
-app.post('/api/paper/trigger-launch', (req, res) => {
+app.post('/api/paper/trigger-launch', async (req, res) => {
   try {
-    (coordinator as any).simulateIncomingLaunch();
-    res.json({ success: true, message: 'Simulated launch ingested into coordinator' });
+    const candidate = await coordinator.scanAndIngestNextFreshLaunch();
+    res.json({ success: true, message: 'Fresh token launch scanned & ingested with on-chain verification', candidate });
   } catch (err: any) {
-    res.status(500).json({ error: err.message || 'Failed to trigger launch' });
+    res.status(500).json({ error: err.message || 'Failed to trigger launch scan' });
   }
 });
 
@@ -405,7 +406,7 @@ app.post('/api/wallet/reset-kill-switch', (req, res) => {
  */
 app.post('/api/wallet/trade-exit', (req, res) => {
   try {
-    const { positionId, action, customStopLossPct, customTakeProfitPct } = req.body;
+    const { positionId, action, customStopLossPct, customTakeProfitPct, realTxSignature } = req.body;
     if (!positionId || !action) {
       return res.status(400).json({ error: 'positionId and action are required' });
     }
@@ -413,6 +414,7 @@ app.post('/api/wallet/trade-exit', (req, res) => {
     const result = walletManager.executeTradeExit(positionId, action, {
       customStopLossPct,
       customTakeProfitPct,
+      realTxSignature,
     });
 
     if (!result.success) {
@@ -550,6 +552,70 @@ app.post('/api/positions/action', (req, res) => {
     return res.status(404).json(result);
   }
   res.json(result);
+});
+
+/**
+ * Build real Solana BUY Swap Transaction for Phantom wallet signing
+ */
+app.post('/api/swap/buy-tx', async (req, res) => {
+  try {
+    const { tokenMint, sizeSol, userPublicKey, slippageBps } = req.body;
+    if (!tokenMint || !sizeSol || !userPublicKey) {
+      return res.status(400).json({ error: 'tokenMint, sizeSol, and userPublicKey are required.' });
+    }
+
+    const quote = await PhantomSwapService.fetchBuyQuote({
+      tokenMint,
+      sizeSol: Number(sizeSol),
+      slippageBps: slippageBps ? Number(slippageBps) : 200,
+    });
+
+    const txData = await PhantomSwapService.buildSwapTransaction({
+      quoteResponse: quote,
+      userPublicKey,
+    });
+
+    res.json({
+      success: true,
+      quote,
+      swapTransaction: txData.swapTransaction,
+      lastValidBlockHeight: txData.lastValidBlockHeight,
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message || 'Failed to build BUY swap transaction' });
+  }
+});
+
+/**
+ * Build real Solana SELL Swap Transaction for Phantom wallet signing
+ */
+app.post('/api/swap/sell-tx', async (req, res) => {
+  try {
+    const { tokenMint, tokenAmountBaseUnits, userPublicKey, slippageBps } = req.body;
+    if (!tokenMint || !tokenAmountBaseUnits || !userPublicKey) {
+      return res.status(400).json({ error: 'tokenMint, tokenAmountBaseUnits, and userPublicKey are required.' });
+    }
+
+    const quote = await PhantomSwapService.fetchSellQuote({
+      tokenMint,
+      tokenAmountBaseUnits: tokenAmountBaseUnits.toString(),
+      slippageBps: slippageBps ? Number(slippageBps) : 250,
+    });
+
+    const txData = await PhantomSwapService.buildSwapTransaction({
+      quoteResponse: quote,
+      userPublicKey,
+    });
+
+    res.json({
+      success: true,
+      quote,
+      swapTransaction: txData.swapTransaction,
+      lastValidBlockHeight: txData.lastValidBlockHeight,
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message || 'Failed to build SELL swap transaction' });
+  }
 });
 
 /**

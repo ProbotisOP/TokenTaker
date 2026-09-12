@@ -213,6 +213,41 @@ export const WalletAutotradeStudio: React.FC<WalletAutotradeStudioProps> = () =>
     const mint = signal.metadata?.mint || signal.tokenMint || 'DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263';
     setIsExecutingSignalId(mint);
     try {
+      const anyWindow = window as any;
+      const provider = anyWindow.phantom?.solana || anyWindow.solana;
+      let realTxSignature: string | undefined = undefined;
+      const tradeSizeSol = config?.minTradeSizeSol || 0.05;
+
+      // If in LIVE mode and real Phantom wallet is connected, request real on-chain transaction signing
+      if (config?.autotradeMode === 'LIVE' && provider?.isPhantom && provider.publicKey) {
+        const buyRes = await fetch('/api/swap/buy-tx', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            tokenMint: mint,
+            sizeSol: tradeSizeSol,
+            userPublicKey: provider.publicKey.toString(),
+            slippageBps: Math.round((config?.maxSlippagePct || 2.0) * 100),
+          }),
+        });
+
+        const buyData = await buyRes.json();
+        if (!buyRes.ok || !buyData.swapTransaction) {
+          throw new Error(buyData.error || 'Failed to generate real DEX swap transaction');
+        }
+
+        const { VersionedTransaction } = await import('@solana/web3.js');
+        const binaryStr = atob(buyData.swapTransaction);
+        const bytes = new Uint8Array(binaryStr.length);
+        for (let i = 0; i < binaryStr.length; i++) {
+          bytes[i] = binaryStr.charCodeAt(i);
+        }
+        const vTx = VersionedTransaction.deserialize(bytes);
+
+        const sendResult = await provider.signAndSendTransaction(vTx);
+        realTxSignature = sendResult.signature;
+      }
+
       const res = await fetch('/api/wallet/execute-signal-trade', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -224,12 +259,17 @@ export const WalletAutotradeStudio: React.FC<WalletAutotradeStudioProps> = () =>
           priceUsd: signal.micro?.priceUsd || signal.priceUsd,
           signalSource: signal.metadata?.launchVenue ? `SOLANA_${signal.metadata.launchVenue}` : 'REAL_TIME_MEMPOOL',
           signalScore: signal.opportunity?.opportunityScore || 88,
-          recommendedSizeSol: config?.minTradeSizeSol || 0.05,
+          recommendedSizeSol: tradeSizeSol,
+          realTxSignature,
         }),
       });
       const data = await res.json();
       if (data.success) {
-        showToast(`Auto-traded $${data.symbol}! Tx: ${data.txSignature?.slice(0, 8)}... (Solscan linked)`);
+        if (data.txSignature) {
+          showToast(`Live trade executed for $${data.symbol}! Tx: ${data.txSignature.slice(0, 8)}... (Solscan linked)`);
+        } else {
+          showToast(`Paper trade recorded for $${data.symbol}! Size: ${data.sizeSol} SOL`);
+        }
         fetchWalletState();
       } else {
         showToast(data.error || 'Signal trade failed', 'error');
@@ -378,6 +418,52 @@ export const WalletAutotradeStudio: React.FC<WalletAutotradeStudioProps> = () =>
     customTp?: number
   ) => {
     try {
+      const trade = activeTrades.find((t) => t.id === positionId);
+      let realTxSignature: string | undefined = undefined;
+
+      if (trade?.isRealWalletTrade && (action === 'FLATTEN_100' || action === 'SCALE_OUT_50')) {
+        const anyWindow = window as any;
+        const provider = anyWindow.phantom?.solana || anyWindow.solana;
+
+        if (!provider || !provider.publicKey) {
+          showToast('Phantom wallet is not connected. Connect Phantom to sign on-chain exit.', 'error');
+          return;
+        }
+
+        const fraction = action === 'FLATTEN_100' ? 1.0 : 0.5;
+        const tokensToSell = Math.floor((trade.sizeTokens || 0) * fraction);
+        const decimals = trade.decimals ?? 6;
+        const baseUnits = BigInt(tokensToSell) * BigInt(10 ** decimals);
+
+        const sellRes = await fetch('/api/swap/sell-tx', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            tokenMint: trade.tokenMint,
+            tokenAmountBaseUnits: baseUnits.toString(),
+            userPublicKey: provider.publicKey.toString(),
+            slippageBps: 250,
+          }),
+        });
+
+        const sellData = await sellRes.json();
+        if (!sellRes.ok || !sellData.swapTransaction) {
+          showToast(`Exit swap route failed: ${sellData.error || 'No DEX route found'}`, 'error');
+          return;
+        }
+
+        const { VersionedTransaction } = await import('@solana/web3.js');
+        const binaryStr = atob(sellData.swapTransaction);
+        const bytes = new Uint8Array(binaryStr.length);
+        for (let i = 0; i < binaryStr.length; i++) {
+          bytes[i] = binaryStr.charCodeAt(i);
+        }
+        const vTx = VersionedTransaction.deserialize(bytes);
+
+        const sendResult = await provider.signAndSendTransaction(vTx);
+        realTxSignature = sendResult.signature;
+      }
+
       const res = await fetch('/api/wallet/trade-exit', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -386,6 +472,7 @@ export const WalletAutotradeStudio: React.FC<WalletAutotradeStudioProps> = () =>
           action,
           customStopLossPct: customSl,
           customTakeProfitPct: customTp,
+          realTxSignature,
         }),
       });
       const data = await res.json();
@@ -1447,14 +1534,18 @@ export const WalletAutotradeStudio: React.FC<WalletAutotradeStudioProps> = () =>
 
                   <button
                     onClick={() => {
-                      const total = config?.balanceSol || 0.12;
+                      const total = config?.balanceSol || 0;
                       const gas = config?.gasReserveSol || 0.025;
-                      const safe = Math.max(0.01, Number((total - gas).toFixed(4)));
-                      const size = Math.max(0.01, Number((safe / 3).toFixed(3)));
+                      const safe = Math.max(0, Number((total - gas).toFixed(4)));
+                      if (safe <= 0) {
+                        showToast('Balance insufficient to allocate capital above gas floor', 'error');
+                        return;
+                      }
+                      const size = Math.max(0.005, Number((safe / 3).toFixed(3)));
                       handleSaveConfig({
                         allocatedCapitalSol: safe,
                         targetTradeSizeSol: size,
-                        minTradeSizeSol: 0.01,
+                        minTradeSizeSol: 0.005,
                         maxTradeSizeSol: Number((size * 1.5).toFixed(3)),
                       });
                       showToast(`Allocated 100% Safe Balance (${safe} SOL)`, 'success');

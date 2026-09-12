@@ -6,3 +6,5 @@ coverage/
 *.log
 .env*
 !.env.example
+*.keypair.json
+.secure_trading_keypair.json

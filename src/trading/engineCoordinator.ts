@@ -29,6 +29,10 @@ import { SafetyEngine } from './safetyEngine.ts';
 import { ScoringEngine } from './scoringEngine.ts';
 import { WalletIntelligence } from './walletIntelligence.ts';
 import { VenueSimulator } from './venueSimulator.ts';
+import { Connection } from '@solana/web3.js';
+import { fetchOnChainSafety } from './onChainSafetyFetcher.ts';
+import { analyzeEarlyFlow } from './earlyBuyerAnalyzer.ts';
+import { FreshLaunchDetector, FreshLaunchCandidate } from './freshLaunchDetector.ts';
 
 export interface CandidateTokenState {
   metadata: TokenMetadata;
@@ -183,8 +187,8 @@ export class EngineCoordinator {
       initialPriceUsd: raw.initialPriceSol * 155.0,
       currentPriceUsd: raw.initialPriceSol * 155.0,
       tokenProgram: 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA',
-      signature: '5Knp...Tx' + Math.random().toString(36).substring(2, 8),
-      poolCreationTx: '4Mwx...PoolInit' + Math.random().toString(36).substring(2, 8),
+      signature: (raw as any).signature || undefined,
+      poolCreationTx: (raw as any).poolCreationTx || undefined,
     };
 
     // 1. Token Safety Evaluation
@@ -214,38 +218,18 @@ export class EngineCoordinator {
     const microEngine = new MicrostructureEngine(raw.initialLiquiditySol, raw.initialPriceSol);
     this.microEngines.set(raw.mint, microEngine);
 
-    // Populate initial launch ticks
+    // Initial placeholder tick for micro initialization
     const buyerWallets: string[] = [];
-    const isClean = !raw.hasMintAuth && !raw.hasFreezeAuth && raw.lpBurnPct === 100 && raw.top1Pct < 15;
-    const numTicks = isClean ? 12 : 5;
-
-    for (let i = 0; i < numTicks; i++) {
-      const isBuy = isClean ? (i !== 3 && i !== 8) : (i % 2 === 0);
-      const sol = isClean ? (0.6 + Math.random() * 2.2) : (0.1 + Math.random() * 0.4);
-      const wAddr = isClean && i < 3
-        ? `SmartAlpha_${Math.random().toString(36).substring(2, 7)}`
-        : `Trader_${Math.random().toString(36).substring(2, 9)}`;
-      buyerWallets.push(wAddr);
-
-      // Give smart alpha traders good reputation
-      if (isClean && i < 3) {
-        const profile = WalletIntelligence.getOrCreateProfile(wAddr);
-        profile.category = WalletCategory.PROFITABLE_TRADER;
-        profile.reputationScore = 0.88;
-        profile.winRate = 0.76;
-      }
-
-      microEngine.recordTick({
-        timestamp: detected_at + (i * 200),
-        isBuy,
-        tokenAmount: Math.floor(sol / raw.initialPriceSol),
-        solAmount: sol,
-        priceSol: raw.initialPriceSol * (1 + (i * 0.022)),
-        priceUsd: raw.initialPriceSol * 155 * (1 + (i * 0.022)),
-        traderWallet: wAddr,
-        isNewWallet: !isClean,
-      });
-    }
+    microEngine.recordTick({
+      timestamp: detected_at,
+      isBuy: true,
+      tokenAmount: 0,
+      solAmount: 0,
+      priceSol: raw.initialPriceSol,
+      priceUsd: raw.initialPriceSol * 155,
+      traderWallet: 'initial_liquidity',
+      isNewWallet: false,
+    });
 
     const micro = microEngine.getSnapshot();
 
@@ -262,16 +246,16 @@ export class EngineCoordinator {
       metadata,
       safety,
       micro,
-      walletQualityScore: isClean ? Math.max(0.78, flowQuality.walletQualityScore) : flowQuality.walletQualityScore,
+      walletQualityScore: flowQuality.walletQualityScore,
       social: {
-        mentionVelocity: isClean ? 65.0 : 14.5,
-        uniqueAccounts: isClean ? 85 : 22,
-        engagementVelocity: isClean ? 180 : 45,
-        sentimentScore: isClean ? 0.82 : 0.65,
-        influencerConcentration: isClean ? 0.08 : 0.28,
-        botProbability: isClean ? 0.06 : 0.45,
+        mentionVelocity: 0,
+        uniqueAccounts: 0,
+        engagementVelocity: 0,
+        sentimentScore: 0,
+        influencerConcentration: 0,
+        botProbability: 0,
         isCoordinatedPump: false,
-        socialCapitalCorrelation: isClean ? 0.85 : 0.35,
+        socialCapitalCorrelation: 0,
       },
       weights: this.weights,
     });
@@ -315,27 +299,44 @@ export class EngineCoordinator {
     let decision = DecisionAction.REJECT;
     const decisionReasons: string[] = [];
 
-    if (!safety.isTradable) {
+    if (this.config.mode === SystemMode.EMERGENCY_STOP) {
+      decision = DecisionAction.REJECT;
+      decisionReasons.push('SYSTEM EMERGENCY STOP ACTIVE');
+    } else if (micro.liquiditySol > this.config.maxInitialLiquiditySol) {
+      decision = DecisionAction.REJECT;
+      decisionReasons.push(`ALREADY PUMPED: Pool liquidity (${micro.liquiditySol.toFixed(1)} SOL) exceeds fresh launch ceiling (${this.config.maxInitialLiquiditySol} SOL). OG rule: Do not chase mature/pumped coins.`);
+    } else if (micro.liquiditySol < this.config.minLiquiditySol) {
+      decision = DecisionAction.REJECT;
+      decisionReasons.push(`INSUFFICIENT LIQUIDITY: Pool liquidity (${micro.liquiditySol.toFixed(1)} SOL) is below minimum viability threshold (${this.config.minLiquiditySol} SOL)`);
+    } else if (!safety.isTradable) {
       decision = DecisionAction.REJECT;
       decisionReasons.push(...safety.rejectReasons);
     } else if (exitabilityScore < 50) {
       decision = DecisionAction.REJECT;
       decisionReasons.push(`ILLIQUID EXITABILITY: Exitability score (${exitabilityScore}/100) below minimum safe threshold (50)`);
-    } else if (opportunity.opportunityScore < this.config.minOpportunityScore) {
-      decision = DecisionAction.REJECT;
-      decisionReasons.push(`LOW ALPHA: Opportunity score (${opportunity.opportunityScore}) below minimum threshold (${this.config.minOpportunityScore})`);
     } else if (!riskCheck.approved) {
       decision = DecisionAction.REJECT;
       decisionReasons.push(...riskCheck.rejectReasons);
     } else if (!preCheck.justifiesEdge) {
       decision = DecisionAction.REJECT;
       decisionReasons.push(preCheck.simulationError || 'Execution cost destroys edge');
-    } else if (this.config.mode === SystemMode.EMERGENCY_STOP) {
-      decision = DecisionAction.REJECT;
-      decisionReasons.push('SYSTEM EMERGENCY STOP ACTIVE');
+    } else if (micro.uniqueBuyers < 2 && micro.volumeSol < 0.3) {
+      decision = DecisionAction.WAIT;
+      decisionReasons.push(`WAIT FOR ACCUMULATION: Passed safety checks (${safety.safetyScore}/100). Awaiting initial buyer quorum (Current buyers: ${micro.uniqueBuyers}, volume: ${micro.volumeSol.toFixed(2)} SOL).`);
+    } else if (micro.priceVelocity > 8.0) {
+      decision = DecisionAction.WAIT;
+      decisionReasons.push(`WAIT FOR PULLBACK: Price velocity (+${micro.priceVelocity.toFixed(1)}%/s) is overextended. Awaiting consolidation entry.`);
+    } else if (opportunity.opportunityScore < this.config.minOpportunityScore) {
+      if (opportunity.opportunityScore >= 50) {
+        decision = DecisionAction.WAIT;
+        decisionReasons.push(`WAIT FOR MOMENTUM: Safety verified (${safety.safetyScore}/100), but alpha score (${opportunity.opportunityScore}/100) is below buy trigger (${this.config.minOpportunityScore}/100). Monitoring flow.`);
+      } else {
+        decision = DecisionAction.REJECT;
+        decisionReasons.push(`LOW ALPHA: Opportunity score (${opportunity.opportunityScore}) below minimum threshold (${this.config.minOpportunityScore})`);
+      }
     } else {
       decision = DecisionAction.BUY;
-      decisionReasons.push(`APPROVED: Safety ${safety.safetyScore}/100, Exitability ${exitabilityScore}/100, Opportunity ${opportunity.opportunityScore}/100, Net Edge +${preCheck.netExpectedEdgePct}%`);
+      decisionReasons.push(`APPROVED: Safety ${safety.safetyScore}/100, Exitability ${exitabilityScore}/100, Opportunity ${opportunity.opportunityScore}/100, Net Edge +${preCheck.netExpectedEdgePct}%, Clean entry structure`);
     }
 
     const candidate: CandidateTokenState = {
@@ -359,9 +360,71 @@ export class EngineCoordinator {
     this.candidateTokens.unshift(candidate);
     if (this.candidateTokens.length > 50) this.candidateTokens.pop();
 
+    if (decision === DecisionAction.REJECT) {
+      console.log(`[REJECT] ${raw.symbol} (${raw.mint.slice(0, 8)}...) | Safety: ${safety.safetyScore}/100 | Opp: ${opportunity.opportunityScore}/100 | ${decisionReasons[0]}`);
+    } else if (decision === DecisionAction.WAIT) {
+      console.log(`[WAIT] ${raw.symbol} (${raw.mint.slice(0, 8)}...) | Safety: ${safety.safetyScore}/100 | Opp: ${opportunity.opportunityScore}/100 | ${decisionReasons[0]}`);
+    }
+
     // If BUY and mode permits, execute entry
     if (decision === DecisionAction.BUY && (this.config.mode === SystemMode.PAPER || this.config.mode === SystemMode.LIVE)) {
       this.executeBuyOrder(candidate, riskCheck.recommendedSizeSol);
+    }
+
+    return candidate;
+  }
+
+  /**
+   * Async ingest that verifies real on-chain safety & early flow before decision
+   */
+  public async ingestWithOnChainData(launch: FreshLaunchCandidate): Promise<CandidateTokenState> {
+    const connection = new Connection(this.config.rpcEndpoint || 'https://api.mainnet-beta.solana.com', 'confirmed');
+    
+    console.log(`[EngineCoordinator] Verifying on-chain safety for $${launch.symbol} (${launch.mint.slice(0, 8)}...)...`);
+    
+    const [safetyData, earlyFlow] = await Promise.all([
+      fetchOnChainSafety(connection, launch.mint, launch.creator, launch.poolAddress).catch(() => null),
+      analyzeEarlyFlow(connection, launch.poolAddress, launch.creator, launch.mint, 170.0).catch(() => null),
+    ]);
+
+    const hasMintAuth = safetyData ? !safetyData.mintAuthorityRevoked : true;
+    const hasFreezeAuth = safetyData ? !safetyData.freezeAuthorityRevoked : true;
+    const lpBurnPct = safetyData ? safetyData.lpBurnPct : 0;
+    const top1Pct = safetyData ? safetyData.top1Percent : 50.0;
+    const top10Pct = safetyData ? safetyData.top10Percent : 80.0;
+    const creatorOwnershipPct = safetyData ? safetyData.creatorOwnershipPercent : 15.0;
+
+    const insiderBundles = earlyFlow ? earlyFlow.bundledWalletsCount : 0;
+    const washTrading = earlyFlow ? earlyFlow.washTradingDetected : false;
+    const creatorDumpRisk = earlyFlow ? earlyFlow.creatorDumpRisk : false;
+
+    const candidate = this.ingestNewTokenLaunch({
+      mint: launch.mint,
+      symbol: launch.symbol,
+      name: launch.name,
+      creator: launch.creator,
+      venue: launch.venue,
+      initialLiquiditySol: launch.initialLiquiditySol,
+      initialPriceSol: launch.initialPriceSol,
+      hasMintAuth,
+      hasFreezeAuth,
+      lpBurnPct,
+      top1Pct,
+      top10Pct,
+      creatorOwnershipPct,
+      insiderBundles,
+      washTrading,
+      creatorDumpRisk,
+    });
+
+    // If we have real swap ticks, populate them
+    if (earlyFlow && earlyFlow.swapTicks.length > 0 && earlyFlow.dataSource === 'on-chain') {
+      const freshMicro = new MicrostructureEngine(launch.initialLiquiditySol, launch.initialPriceSol);
+      for (const tick of earlyFlow.swapTicks) {
+        freshMicro.recordTick(tick);
+      }
+      this.microEngines.set(launch.mint, freshMicro);
+      (candidate as any).micro = freshMicro.getSnapshot();
     }
 
     return candidate;
@@ -622,112 +685,54 @@ export class EngineCoordinator {
   private startLiveSimulation(): void {
     if (this.simulationInterval) return;
 
-    // Simulation loop for new token launches (every 7 seconds) and position ticking (every 1 second)
+    // Position ticking every 1s, new launch scan every 15s
     let tickCount = 0;
     this.simulationInterval = setInterval(() => {
       this.tickPositions();
       tickCount++;
 
-      if (tickCount % 6 === 0 && this.config.mode !== SystemMode.EMERGENCY_STOP) {
-        this.simulateIncomingLaunch();
+      if (tickCount % 15 === 0 && this.config.mode !== SystemMode.EMERGENCY_STOP && !this.isProcessing) {
+        this.isProcessing = true;
+        this.scanAndIngestNextFreshLaunch().finally(() => {
+          this.isProcessing = false;
+        });
       }
     }, 1000);
   }
 
-  private simulateIncomingLaunch(): void {
-    const memes = [
-      { name: 'Quantum Shib', symbol: 'QSHIB', venue: LaunchVenue.PUMPFUN },
-      { name: 'Solana Speedster', symbol: 'SPEEDY', venue: LaunchVenue.RAYDIUM_AMM_V4 },
-      { name: 'Laser Eyes Whale', symbol: 'WHALE', venue: LaunchVenue.RAYDIUM_CPMM },
-      { name: 'Meteora Dynamic Sol', symbol: 'DYNASOL', venue: LaunchVenue.METEORA_DLMM },
-      { name: 'Rugbait Honey', symbol: 'RUGBAIT', venue: LaunchVenue.PUMPFUN },
-      { name: 'HedgeFund Pepe', symbol: 'HFPEPE', venue: LaunchVenue.RAYDIUM_AMM_V4 },
-    ];
+  /**
+   * Scans and ingests the next genuine fresh launch from DexScreener with on-chain verification
+   */
+  public async scanAndIngestNextFreshLaunch(): Promise<CandidateTokenState | null> {
+    try {
+      const detector = FreshLaunchDetector.getInstance();
+      let nextLaunch = detector.getNextFreshLaunch();
 
-    const pick = memes[Math.floor(Math.random() * memes.length)];
-    const isBadLaunch = pick.symbol === 'RUGBAIT' || Math.random() < 0.35;
+      if (!nextLaunch) {
+        const fresh = await detector.scanForFreshLaunches();
+        nextLaunch = fresh[0] || null;
+      }
 
-    this.ingestNewTokenLaunch({
-      mint: `SoL${Math.random().toString(36).substring(2, 6)}...${pick.symbol}`,
-      name: pick.name,
-      symbol: pick.symbol,
-      creator: `Deployer_${Math.random().toString(36).substring(2, 8)}`,
-      venue: pick.venue,
-      initialLiquiditySol: isBadLaunch ? 3.5 : 12.0 + (Math.random() * 25.0),
-      initialPriceSol: 0.0000025 + (Math.random() * 0.0000015),
-      hasMintAuth: isBadLaunch && Math.random() < 0.6,
-      hasFreezeAuth: isBadLaunch && Math.random() < 0.5,
-      lpBurnPct: isBadLaunch ? 40 : 100,
-      top1Pct: isBadLaunch ? 24.5 : 9.2,
-      top10Pct: isBadLaunch ? 74.0 : 41.5,
-      creatorOwnershipPct: isBadLaunch ? 14.0 : 2.5,
-      insiderBundles: isBadLaunch ? 5 : 0,
-      washTrading: isBadLaunch && Math.random() < 0.4,
-      creatorDumpRisk: isBadLaunch && Math.random() < 0.5,
-    });
+      if (!nextLaunch) {
+        return null;
+      }
+
+      return await this.ingestWithOnChainData(nextLaunch);
+    } catch (err) {
+      console.warn('[EngineCoordinator] Error scanning fresh launch:', err);
+      return null;
+    }
   }
 
   private seedInitialState(): void {
-    // Seed initial historical trades for dashboard visual richness
-    const seedLaunches = [
-      {
-        mint: 'SoL9842...PEPE2',
-        symbol: 'PEPE2',
-        name: 'Pepe 2.0 Solana',
-        creator: 'Auth_39x...Seed',
-        venue: LaunchVenue.PUMPFUN,
-        initialLiquiditySol: 18.5,
-        initialPriceSol: 0.0000018,
-        hasMintAuth: false,
-        hasFreezeAuth: false,
-        lpBurnPct: 100,
-        top1Pct: 8.5,
-        top10Pct: 38.2,
-        creatorOwnershipPct: 1.8,
-        insiderBundles: 0,
-        washTrading: false,
-        creatorDumpRisk: false,
-      },
-      {
-        mint: 'SoL1190...DOGEAI',
-        symbol: 'DOGEAI',
-        name: 'Doge Agent AI',
-        creator: 'Auth_55p...Seed',
-        venue: LaunchVenue.RAYDIUM_AMM_V4,
-        initialLiquiditySol: 28.0,
-        initialPriceSol: 0.0000034,
-        hasMintAuth: false,
-        hasFreezeAuth: false,
-        lpBurnPct: 100,
-        top1Pct: 11.2,
-        top10Pct: 44.0,
-        creatorOwnershipPct: 3.2,
-        insiderBundles: 1,
-        washTrading: false,
-        creatorDumpRisk: false,
-      },
-      {
-        mint: 'SoL7721...RUGSCAM',
-        symbol: 'SCAMPUMP',
-        name: 'Scam Pump Token',
-        creator: 'Auth_99z...BadDeployer',
-        venue: LaunchVenue.PUMPFUN,
-        initialLiquiditySol: 4.2,
-        initialPriceSol: 0.0000011,
-        hasMintAuth: true,
-        hasFreezeAuth: true,
-        lpBurnPct: 20,
-        top1Pct: 31.0,
-        top10Pct: 82.0,
-        creatorOwnershipPct: 21.0,
-        insiderBundles: 6,
-        washTrading: true,
-        creatorDumpRisk: true,
-      },
-    ];
-
-    for (const item of seedLaunches) {
-      this.ingestNewTokenLaunch(item);
-    }
+    // Initial scan of live fresh launches
+    const detector = FreshLaunchDetector.getInstance();
+    detector.scanForFreshLaunches().then(async (launches) => {
+      for (const launch of launches.slice(0, 3)) {
+        await this.ingestWithOnChainData(launch).catch(() => {});
+      }
+    }).catch((err) => {
+      console.warn('[EngineCoordinator] Initial seed warning:', err);
+    });
   }
 }

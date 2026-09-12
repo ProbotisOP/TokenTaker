@@ -144,16 +144,7 @@ export const App: React.FC = () => {
 
   // Manual flatten single position
   const handleManualClosePosition = async (positionId: string) => {
-    try {
-      await fetch('/api/positions/action', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ positionId, action: 'MANUAL_CLOSE' }),
-      });
-      fetchState();
-    } catch (err) {
-      console.error('Manual close error', err);
-    }
+    await handleTradeExit(positionId, 'FLATTEN_100');
   };
 
   // Granular trade exit execution (100% exit, 50% scale, breakeven SL, custom SL/TP)
@@ -164,6 +155,55 @@ export const App: React.FC = () => {
     customTp?: number
   ) => {
     try {
+      const pos = activePositions.find((p) => p.id === positionId);
+      let realTxSignature: string | undefined = undefined;
+
+      // If it's a real wallet trade on-chain, request Phantom signature to sell tokens back to SOL
+      if (pos?.isRealWalletTrade && (action === 'FLATTEN_100' || action === 'SCALE_OUT_50')) {
+        const anyWindow = window as any;
+        const provider = anyWindow.phantom?.solana || anyWindow.solana;
+
+        if (!provider || !provider.publicKey) {
+          alert('Phantom wallet is not connected. Please connect Phantom to sign the real on-chain exit.');
+          return;
+        }
+
+        const fraction = action === 'FLATTEN_100' ? 1.0 : 0.5;
+        const tokensToSell = Math.floor(pos.sizeTokens * fraction);
+        // Pump.fun / Raydium tokens usually use 6 decimals. Default to 6 decimals
+        const decimals = (pos as any).decimals ?? 6;
+        const baseUnits = BigInt(tokensToSell) * BigInt(10 ** decimals);
+
+        const sellRes = await fetch('/api/swap/sell-tx', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            tokenMint: pos.tokenMint,
+            tokenAmountBaseUnits: baseUnits.toString(),
+            userPublicKey: provider.publicKey.toString(),
+            slippageBps: 250,
+          }),
+        });
+
+        const sellData = await sellRes.json();
+        if (!sellRes.ok || !sellData.swapTransaction) {
+          alert(`Failed to build DEX exit transaction: ${sellData.error || 'No route found'}`);
+          return;
+        }
+
+        const { VersionedTransaction } = await import('@solana/web3.js');
+        const binaryStr = atob(sellData.swapTransaction);
+        const bytes = new Uint8Array(binaryStr.length);
+        for (let i = 0; i < binaryStr.length; i++) {
+          bytes[i] = binaryStr.charCodeAt(i);
+        }
+        const vTx = VersionedTransaction.deserialize(bytes);
+
+        // Sign and broadcast on Solana
+        const sendResult = await provider.signAndSendTransaction(vTx);
+        realTxSignature = sendResult.signature;
+      }
+
       await fetch('/api/wallet/trade-exit', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -172,11 +212,13 @@ export const App: React.FC = () => {
           action,
           customStopLossPct: customSl,
           customTakeProfitPct: customTp,
+          realTxSignature,
         }),
       });
       fetchState();
-    } catch (err) {
+    } catch (err: any) {
       console.error('Trade exit error', err);
+      alert(`Trade exit error: ${err.message || err}`);
     }
   };
 

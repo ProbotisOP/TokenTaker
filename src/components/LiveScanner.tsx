@@ -7,6 +7,7 @@ import {
   ArrowRight,
   Flame,
   Zap,
+  Clock,
 } from 'lucide-react';
 import { CandidateTokenState, DecisionAction, RiskLevel } from '../types.ts';
 
@@ -56,6 +57,14 @@ export const LiveScanner: React.FC<LiveScannerProps> = ({ candidates, onSelectCa
         <span className="px-2 py-0.5 rounded text-[11px] font-mono font-bold bg-emerald-500 text-zinc-950 uppercase tracking-wider flex items-center gap-1">
           <Zap className="w-3 h-3 fill-current" />
           APPROVED BUY
+        </span>
+      );
+    }
+    if (decision === DecisionAction.WAIT) {
+      return (
+        <span className="px-2 py-0.5 rounded text-[11px] font-mono font-bold bg-amber-500/20 text-amber-300 border border-amber-500/40 uppercase tracking-wider flex items-center gap-1">
+          <Clock className="w-3 h-3" />
+          WAITING
         </span>
       );
     }
@@ -172,6 +181,11 @@ export const LiveScanner: React.FC<LiveScannerProps> = ({ candidates, onSelectCa
                       {isApproved ? (
                         <span className="text-emerald-400 font-semibold flex items-center gap-1">
                           <ShieldCheck className="w-3 h-3" />
+                          {c.decisionReasons[0]}
+                        </span>
+                      ) : c.decision === DecisionAction.WAIT ? (
+                        <span className="text-amber-300/90 flex items-center gap-1">
+                          <Clock className="w-3 h-3 shrink-0" />
                           {c.decisionReasons[0]}
                         </span>
                       ) : (
