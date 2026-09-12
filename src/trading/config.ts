@@ -11,7 +11,7 @@ export const DEFAULT_RISK_LIMITS: RiskLimits = {
   maxTradeLossSol: 1.0, // 1 SOL max loss per single trade
   maxOpenPositions: 4, // Max 4 concurrent open positions
   maxTokenExposurePercent: 0.08, // 8% max exposure in any single token
-  maxSlippagePercent: 2.5, // 2.5% max allowable slippage
+  maxSlippagePercent: 3.5, // 3.5% max allowable slippage (standard for Solana memecoin swaps)
   maxConsecutiveLosses: 3, // Auto-halt after 3 consecutive losses
   circuitBreakerActive: false,
 };

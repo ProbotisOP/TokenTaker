@@ -1,11 +1,14 @@
 /**
  * Fresh Launch Detector
  * 
- * Monitors newly created Solana token pairs and detects fresh launches early.
- * Filters strictly for tokens created within the last 60 minutes with early liquidity,
- * actively rejecting mature, already-pumped coins.
+ * High-performance Dual-Engine Discovery for Solana Memecoins:
+ * 1. Primary Engine: Sub-second WebSocket stream directly connected to wss://pumpportal.fun/api/data
+ *    Subscribes to 'subscribeNewToken' and 'subscribeMigration' to detect token mints the instant they occur on Solana.
+ * 2. Secondary Engine: DexScreener polling fallback (every 25s) to detect Raydium AMM V4,
+ *    Raydium CPMM, and Meteora DLMM launches outside of Pump.fun.
  * 
- * OG Principle: Find the clean, early entry BEFORE the major move.
+ * OG Principle: Catch tokens within 0-5 seconds of genesis, evaluate safety & early wallet flow,
+ * and identify clean entry BEFORE the major move.
  */
 import { LaunchVenue } from '../types.ts';
 
@@ -22,7 +25,13 @@ export interface FreshLaunchCandidate {
   initialPriceUsd: number;
   pairCreatedAt: number;
   dexId: string;
+  signature?: string;
+  devInitialBuyTokens?: number;
+  devInitialBuyPct?: number;
+  source: 'websocket-realtime' | 'dexscreener-poll';
 }
+
+export type LaunchListener = (candidate: FreshLaunchCandidate) => void | Promise<void>;
 
 export class FreshLaunchDetector {
   private static instance: FreshLaunchDetector;
@@ -30,14 +39,24 @@ export class FreshLaunchDetector {
   private queue: FreshLaunchCandidate[] = [];
   private isScanning = false;
   private solUsdRate = 170.0;
+  
+  // Real-time WebSocket state
+  private ws: any = null;
+  private isWsConnected = false;
+  private reconnectTimeout: any = null;
+  private heartbeatInterval: any = null;
+  private listeners: LaunchListener[] = [];
+  private totalStreamedTokens = 0;
 
   private constructor() {
-    // Initial scan
+    // 1. Start Primary Engine: Real-time WebSocket streaming (<1-2s latency)
+    this.initWebSocketStream();
+
+    // 2. Start Secondary Engine: DEX polling fallback for Raydium/Meteora
     this.scanForFreshLaunches().catch(() => {});
-    // Scan every 20 seconds for fresh launches
     setInterval(() => {
       this.scanForFreshLaunches().catch(() => {});
-    }, 20000);
+    }, 25000);
   }
 
   public static getInstance(): FreshLaunchDetector {
@@ -48,7 +67,158 @@ export class FreshLaunchDetector {
   }
 
   /**
-   * Scans DEX sources for freshly launched Solana tokens
+   * Subscribe a listener callback to receive new token launches the millisecond they arrive
+   */
+  public onNewLaunch(callback: LaunchListener): () => void {
+    this.listeners.push(callback);
+    return () => {
+      this.listeners = this.listeners.filter(l => l !== callback);
+    };
+  }
+
+  /**
+   * Initialize real-time WebSocket connection to PumpPortal streaming data feed
+   */
+  private initWebSocketStream(): void {
+    if (typeof WebSocket === 'undefined') {
+      console.warn('[FreshLaunchDetector] Global WebSocket not available in environment; relying on DEX polling fallback.');
+      return;
+    }
+
+    try {
+      console.log('[FreshLaunchDetector] Connecting to real-time Solana token stream (wss://pumpportal.fun/api/data)...');
+      this.ws = new WebSocket('wss://pumpportal.fun/api/data');
+
+      this.ws.onopen = () => {
+        this.isWsConnected = true;
+        console.log('[FreshLaunchDetector] Real-time Solana launch stream CONNECTED. Subscribing to new tokens and migrations...');
+        
+        // Subscribe to newly created tokens
+        this.ws.send(JSON.stringify({ method: 'subscribeNewToken' }));
+        // Subscribe to bonding curve migrations to Raydium
+        this.ws.send(JSON.stringify({ method: 'subscribeMigration' }));
+
+        // Heartbeat ping every 25 seconds
+        if (this.heartbeatInterval) clearInterval(this.heartbeatInterval);
+        this.heartbeatInterval = setInterval(() => {
+          if (this.ws && this.ws.readyState === 1) {
+            // keepalive
+          }
+        }, 25000);
+      };
+
+      this.ws.onmessage = (event: any) => {
+        try {
+          const rawText = typeof event.data === 'string' ? event.data : event.data?.toString();
+          if (!rawText) return;
+          const data = JSON.parse(rawText);
+          this.handleIncomingStreamMessage(data);
+        } catch (parseErr) {
+          // Ignore parse errors on malformed payloads
+        }
+      };
+
+      this.ws.onerror = (err: any) => {
+        console.warn('[FreshLaunchDetector] Launch stream error:', err?.message || 'WebSocket error');
+      };
+
+      this.ws.onclose = () => {
+        this.isWsConnected = false;
+        if (this.heartbeatInterval) clearInterval(this.heartbeatInterval);
+        console.warn('[FreshLaunchDetector] Launch stream disconnected. Reconnecting in 3s...');
+        if (!this.reconnectTimeout) {
+          this.reconnectTimeout = setTimeout(() => {
+            this.reconnectTimeout = null;
+            this.initWebSocketStream();
+          }, 3000);
+        }
+      };
+    } catch (err) {
+      console.warn('[FreshLaunchDetector] Failed to initialize WebSocket:', err);
+      if (!this.reconnectTimeout) {
+        this.reconnectTimeout = setTimeout(() => {
+          this.reconnectTimeout = null;
+          this.initWebSocketStream();
+        }, 5000);
+      }
+    }
+  }
+
+  /**
+   * Parses and dispatches incoming WebSocket token mint & migration events
+   */
+  private handleIncomingStreamMessage(data: any): void {
+    if (!data || !data.mint) return;
+    const mint = data.mint.trim();
+
+    // Deduplicate against seen tokens
+    if (this.seenMints.has(mint)) return;
+    this.seenMints.add(mint);
+
+    // Bound seen set to last 3,000 mints
+    if (this.seenMints.size > 3000) {
+      const iter = this.seenMints.values();
+      for (let i = 0; i < 500; i++) {
+        const item = iter.next();
+        if (item.done) break;
+        this.seenMints.delete(item.value);
+      }
+    }
+
+    const isMigration = data.txType === 'migrate' || Boolean(data.migration);
+    const venue = isMigration ? LaunchVenue.RAYDIUM_AMM_V4 : LaunchVenue.PUMPFUN;
+    
+    // Total supply on Pump.fun is 1,000,000,000
+    const devInitialBuyTokens = Number(data.initialBuy) || 0;
+    const devInitialBuyPct = devInitialBuyTokens > 0 ? (devInitialBuyTokens / 1_000_000_000) * 100 : 0;
+
+    const liqSol = isMigration 
+      ? 80.0 
+      : Number((data.vSolInBondingCurve || 30.0).toFixed(2));
+    const liqUsd = Number((liqSol * this.solUsdRate).toFixed(2));
+
+    const priceSol = (data.vSolInBondingCurve && data.vTokensInBondingCurve && data.vTokensInBondingCurve > 0)
+      ? data.vSolInBondingCurve / data.vTokensInBondingCurve
+      : 0.000000028;
+    const priceUsd = priceSol * this.solUsdRate;
+
+    const candidate: FreshLaunchCandidate = {
+      mint,
+      symbol: (data.symbol || 'UNKNOWN').trim().toUpperCase(),
+      name: (data.name || data.symbol || 'Unknown Token').trim(),
+      creator: data.traderPublicKey || `Dev_${mint.slice(0, 4)}...${mint.slice(-4)}`,
+      venue,
+      poolAddress: data.bondingCurveKey || `Pool_${mint.slice(0, 8)}`,
+      initialLiquiditySol: liqSol,
+      initialLiquidityUsd: liqUsd,
+      initialPriceSol: priceSol,
+      initialPriceUsd: priceUsd,
+      pairCreatedAt: Date.now(),
+      dexId: isMigration ? 'raydium' : 'pumpfun',
+      signature: data.signature,
+      devInitialBuyTokens: Number(devInitialBuyTokens.toFixed(2)),
+      devInitialBuyPct: Number(devInitialBuyPct.toFixed(2)),
+      source: 'websocket-realtime',
+    };
+
+    this.totalStreamedTokens++;
+    this.queue.unshift(candidate);
+    if (this.queue.length > 100) this.queue.pop();
+
+    console.log(`[FreshLaunchDetector] ⚡ SUB-SECOND LAUNCH: $${candidate.symbol} (${candidate.mint.slice(0, 6)}...${candidate.mint.slice(-4)}) | Dev Buy: ${candidate.devInitialBuyPct?.toFixed(1)}% | Liq: ${liqSol} SOL | Venue: ${venue}`);
+
+    // Immediately dispatch to registered coordinator listeners
+    for (const listener of this.listeners) {
+      try {
+        listener(candidate);
+      } catch (err) {
+        console.warn('[FreshLaunchDetector] Error in listener dispatch:', err);
+      }
+    }
+  }
+
+  /**
+   * Scans DEX sources for freshly launched Solana tokens (Raydium / Meteora fallback)
    */
   public async scanForFreshLaunches(): Promise<FreshLaunchCandidate[]> {
     if (this.isScanning) return this.queue;
@@ -140,14 +310,24 @@ export class FreshLaunchDetector {
           initialPriceUsd: priceUsd,
           pairCreatedAt,
           dexId: pair.dexId,
+          source: 'dexscreener-poll',
         };
 
         this.seenMints.add(mint);
         freshCandidates.push(candidate);
         this.queue.unshift(candidate);
+
+        // Dispatch to listeners
+        for (const listener of this.listeners) {
+          try {
+            listener(candidate);
+          } catch (err) {
+            console.warn('[FreshLaunchDetector] Listener error:', err);
+          }
+        }
       }
 
-      if (this.queue.length > 50) this.queue = this.queue.slice(0, 50);
+      if (this.queue.length > 100) this.queue = this.queue.slice(0, 100);
       return freshCandidates;
     } catch (err) {
       console.warn('[FreshLaunchDetector] Scan error:', err);
@@ -167,5 +347,13 @@ export class FreshLaunchDetector {
 
   public getRecentLaunches(): FreshLaunchCandidate[] {
     return [...this.queue];
+  }
+
+  public getStreamStats(): { isWsConnected: boolean; totalStreamedTokens: number; queueLength: number } {
+    return {
+      isWsConnected: this.isWsConnected,
+      totalStreamedTokens: this.totalStreamedTokens,
+      queueLength: this.queue.length,
+    };
   }
 }

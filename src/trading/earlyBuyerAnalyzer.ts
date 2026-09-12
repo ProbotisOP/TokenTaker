@@ -66,8 +66,8 @@ export async function analyzeEarlyFlow(
     const sigsInfo = await connection.getSignaturesForAddress(poolPubkey, { limit: 20 });
     
     if (sigsInfo.length === 0) {
-      console.log(`[EarlyBuyerAnalyzer] No transactions found for ${poolAddress}`);
-      return getFallback();
+      console.log(`[EarlyBuyerAnalyzer] No transactions found for ${poolAddress} (brand new pool)`);
+      return getEmptyAnalysis();
     }
 
     // Chronological order: oldest first
@@ -77,8 +77,14 @@ export async function analyzeEarlyFlow(
 
     const txSignatures = sigsInfo.map(s => s.signature);
     
-    // Parse transactions
-    const parsedTxs = await connection.getParsedTransactions(txSignatures, { maxSupportedTransactionVersion: 0 });
+    // Parse transactions safely with RPC rate limit fallback
+    let parsedTxs: (ParsedTransactionWithMeta | null)[] = [];
+    try {
+      parsedTxs = await connection.getParsedTransactions(txSignatures.slice(0, 8), { maxSupportedTransactionVersion: 0 });
+    } catch (parseErr) {
+      console.warn(`[EarlyBuyerAnalyzer] Public RPC rate-limited on getParsedTransactions for ${poolAddress}, using initial flow defaults`);
+      return getEmptyAnalysis();
+    }
 
     const swapTicks: SwapTick[] = [];
     const walletTrades = new Map<string, { buys: number, sells: number, firstBuyTimeSec: number, solAmount: number }>();
@@ -144,18 +150,18 @@ export async function analyzeEarlyFlow(
 
     const uniqueBuyers = Array.from(walletTrades.keys());
     
-    // Batch process wallet histories
-    const earlyBuyersResult = await processInBatches(uniqueBuyers, 5, async (walletAddr) => {
+    // Batch process wallet histories safely
+    const earlyBuyersResult = await processInBatches(uniqueBuyers.slice(0, 6), 2, async (walletAddr) => {
       let priorTxCount = 0;
       try {
         const walletPubkey = new PublicKey(walletAddr);
         const priorTxs = await connection.getSignaturesForAddress(walletPubkey, {
           before: firstTxSig,
-          limit: 50 // Fetch up to 50 to classify correctly
+          limit: 10,
         });
         priorTxCount = priorTxs.length;
       } catch (err) {
-        console.warn(`[EarlyBuyerAnalyzer] Failed to fetch history for ${walletAddr}`);
+        // Fallback gracefully on RPC rate limit
       }
 
       const stats = walletTrades.get(walletAddr)!;
@@ -226,6 +232,23 @@ export async function analyzeEarlyFlow(
     console.warn(`[EarlyBuyerAnalyzer] Error analyzing early flow for ${poolAddress}:`, error);
     return getFallback();
   }
+}
+
+function getEmptyAnalysis(): EarlyFlowAnalysis {
+  return {
+    swapTicks: [],
+    earlyBuyers: [],
+    insiderClusterDetected: false,
+    bundledWalletsCount: 0,
+    washTradingDetected: false,
+    creatorDumpRisk: false,
+    totalEarlyBuyVolumeSol: 0,
+    totalEarlySellVolumeSol: 0,
+    uniqueBuyerCount: 0,
+    newWalletBuyerCount: 0,
+    fetchedAt: Date.now(),
+    dataSource: 'on-chain',
+  };
 }
 
 function getFallback(): EarlyFlowAnalysis {

@@ -69,8 +69,9 @@ export class ScoringEngine {
     const socialSignal = Math.max(0.0, Math.min(1.0, (social.sentimentScore + 1) / 2 * (social.socialCapitalCorrelation > 0 ? 1 : 0.4)));
 
     // Deductions:
-    // Slippage impact: estimate base slippage from pool depth (e.g. 1 SOL trade against pool)
-    const estImpactPct = (1.0 / (liqSol + 0.1)) * 100;
+    // Slippage impact: estimate base slippage from pool depth for realistic memecoin early entry (0.25 SOL benchmark)
+    const benchmarkTradeSol = 0.25;
+    const estImpactPct = (benchmarkTradeSol / (liqSol + benchmarkTradeSol)) * 100;
     const slippageDeduction = Math.min(1.0, estImpactPct / 6.0);
 
     // Concentration risk: top 1 and top 10 holders
